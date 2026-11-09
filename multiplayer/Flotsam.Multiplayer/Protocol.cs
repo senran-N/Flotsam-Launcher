@@ -48,6 +48,13 @@ public sealed class WorldFrame
     public CrewMember[] crew=Array.Empty<CrewMember>();
     public Rules rules=new Rules();
     public FleetShipState[] ships=Array.Empty<FleetShipState>();
+    public FleetActionState[] actions=Array.Empty<FleetActionState>();
+}
+public sealed class FleetActionState
+{
+    public long id;
+    public string kind="",label="";
+    public float startX,startZ,endX,endZ;
 }
 public sealed class FleetShipState
 {

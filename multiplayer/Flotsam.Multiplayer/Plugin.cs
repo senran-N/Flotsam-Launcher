@@ -112,6 +112,7 @@ public sealed class Plugin : BaseUnityPlugin
             }
             Network?.Update();
             FleetOwnedNavigation.Tick(Time.deltaTime);
+            FleetPhysicalActors.Tick(Time.deltaTime);
             if (Network != null && File.Exists(Path.Combine(ReportRoot, "stop"))) Network.Dispose();
             if (Time.realtimeSinceStartup >= _nextReport)
             {

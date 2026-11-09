@@ -64,6 +64,10 @@ internal static class GamePatches
         foreach(var disconnect in AccessTools.GetDeclaredMethods(typeof(EnergyGridBuildableComponent)))
             if(disconnect.Name=="Disconnect"&&disconnect.GetParameters().Length==1)
                 harmony.Patch(disconnect,prefix:new HarmonyMethod(typeof(GamePatches),nameof(DisconnectEnergy)));
+        var initBuildablePanel=AccessTools.DeclaredMethod(typeof(BuildablePanel),"Initialize",new[]{typeof(Buildable),typeof(bool)});
+        if(initBuildablePanel!=null)harmony.Patch(initBuildablePanel,postfix:new HarmonyMethod(typeof(FleetHud),nameof(FleetHud.OnBuildablePanelInitialize)));
+        var updateBuildablePanel=AccessTools.DeclaredMethod(typeof(BuildablePanel),"UpdatePanel",Type.EmptyTypes);
+        if(updateBuildablePanel!=null)harmony.Patch(updateBuildablePanel,postfix:new HarmonyMethod(typeof(FleetHud),nameof(FleetHud.OnBuildablePanelUpdate)));
         // A client replica never writes an authoritative save or triggers auto-save achievements.
         foreach(var method in AccessTools.GetDeclaredMethods(typeof(PlayerRun)))if(method.Name=="Save")harmony.Patch(method,prefix:new HarmonyMethod(typeof(GamePatches),nameof(CanSave)));
     }

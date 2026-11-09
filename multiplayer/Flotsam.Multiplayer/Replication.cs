@@ -94,7 +94,7 @@ internal sealed class Replication
                 research=Economy.CaptureResearch(owner)
             };
         }).ToArray();
-        var frame=new WorldFrame{sequence=sequence,worldOwner=community.Name??"",buildings=buildings.ToArray(),agents=agents.ToArray(),researchPoints=community.Research.ResearchPoints,researched=community.Research.ResearchedBuildableProperties.Select(p=>p.name).OrderBy(s=>s,StringComparer.Ordinal).ToArray(),worldX=world.TownheartWorldPosition.x,worldZ=world.TownheartWorldPosition.z,worldRotation=world.TownheartRotation.eulerAngles.y,speed=(int)GameSpeedManager.GameSpeed,research=Economy.CaptureResearch(community),unlockedTech=Economy.UnlockedTech(),rules=Plugin.Options.rules,ships=fleetShips};
+        var frame=new WorldFrame{sequence=sequence,worldOwner=community.Name??"",buildings=buildings.ToArray(),agents=agents.ToArray(),researchPoints=community.Research.ResearchPoints,researched=community.Research.ResearchedBuildableProperties.Select(p=>p.name).OrderBy(s=>s,StringComparer.Ordinal).ToArray(),worldX=world.TownheartWorldPosition.x,worldZ=world.TownheartWorldPosition.z,worldRotation=world.TownheartRotation.eulerAngles.y,speed=(int)GameSpeedManager.GameSpeed,research=Economy.CaptureResearch(community),unlockedTech=Economy.UnlockedTech(),rules=Plugin.Options.rules,ships=fleetShips,actions=FleetPhysicalActors.CaptureRecentActions()};
         Salvage.Capture(frame,HostId);NavigationReplication.Capture(frame);frame.assets=AssetTable.Capture();return frame;
     }
     public void Apply(WorldFrame frame)
@@ -226,6 +226,7 @@ internal sealed class Replication
         }
         foreach(var pair in _agents.ToArray())if(!aliveAgents.Contains(pair.Key)){if(pair.Value!=null){var owner=pair.Value.Community??community;owner.RemoveAgent(pair.Value);UnityEngine.Object.Destroy(pair.Value.gameObject);}_agents.Remove(pair.Key);_agentTargets.Remove(pair.Key);}
         if(frame.rules!=null)Plugin.Options.rules=frame.rules;
+        FleetPhysicalActors.ApplyRemoteActions(frame.actions);
         if(frame.ships!=null&&frame.ships.Length>0)
         {
             foreach(var shipState in frame.ships)
@@ -422,52 +423,97 @@ internal sealed class Replication
     }
     private string? ExecuteFleetInteraction(GameCommand command,Community actor,Vector3 actorPos)
     {
+        if(command.text=="__practice__")
+        {
+            var practiceEnd=FleetPhysicalActors.GetOrSpawnPracticeTarget(actorPos);
+            var label=command.properties=="Plastic"?"塑料 ×5":command.properties=="Food"?"食水补给":"木材 ×5";
+            FleetPhysicalActors.RecordAndSpawn(command.kind,label,actorPos,practiceEnd);
+            return null;
+        }
         if(!Plugin.Options.rules.Allows(command.kind))return "当前房间规则未开启该跨船操作";
-        var other=ResolveCommunity(command.text);
+        Buildable? clickedBuilding=null;
+        if(command.target>0)_buildings.TryGetValue(command.target,out clickedBuilding);
+        var other=clickedBuilding?.Community!=null&&!ReferenceEquals(clickedBuilding.Community,actor)
+            ?clickedBuilding.Community
+            :ResolveCommunity(command.text);
         if(other==null||ReferenceEquals(other,actor))return "目标船只不存在";
-        var otherPos=FleetEngineBundle.RootFor(other)?.transform.position??Construction.TownheartPosition;
+        var otherPos=clickedBuilding!=null?clickedBuilding.transform.position:(FleetEngineBundle.RootFor(other)?.transform.position??Construction.TownheartPosition);
         if(command.kind=="shipTransfer")
         {
             var amount=Mathf.Clamp(command.amount<=0?5:command.amount,1,20);
-            var moved=TransferItemsBetweenShips(actor,other,command.properties,amount);
-            return moved>0?null:"我方船只库存中没有足够的该类物资，或对方船舱已满";
+            var extracted=ExtractItemsFromShip(actor,command.properties,amount);
+            if(extracted.Count==0)return "我方船只库存中没有足够的该类物资";
+            var itemLabel=command.properties=="Plastic"?$"塑料 ×{extracted.Count}":command.properties=="Food"?$"食物 ×{extracted.Count}":command.properties=="Drink"?$"淡水 ×{extracted.Count}":$"木材 ×{extracted.Count}";
+            FleetPhysicalActors.RecordAndSpawn("shipTransfer",itemLabel,actorPos,otherPos,onArriveTarget:()=>
+            {
+                foreach(var prop in extracted)if(prop!=null)other.SpawnItemToAvailableStorage(prop);
+            });
+            return null;
         }
-        if((otherPos-actorPos).sqrMagnitude>140f*140f)return "距离过远，请先将船驶近至 140m 内";
+        if((otherPos-actorPos).sqrMagnitude>160f*160f)return "距离过远，请先将船驶近至 160m 内";
         if(command.kind=="shipSteal")
         {
-            var moved=TransferItemsBetweenShips(other,actor,command.properties,Mathf.Clamp(command.amount<=0?3:command.amount,1,5));
-            return moved>0?null:"对方船舱暂无可掠夺的物资，或我方仓库已满";
+            if(!HasStealableItems(other))return "对方船舱暂无可掠夺的未锁定物资";
+            var maxLoot=Mathf.Clamp(command.amount<=0?3:command.amount,1,5);
+            var loot=new List<ItemProperties>();
+            FleetPhysicalActors.RecordAndSpawn("shipSteal","劫掠物资",actorPos,otherPos,
+                onArriveTarget:()=>
+                {
+                    loot=ExtractItemsFromShip(other,command.properties,maxLoot);
+                },
+                onReturnHome:()=>
+                {
+                    foreach(var prop in loot)if(prop!=null)actor.SpawnItemToAvailableStorage(prop);
+                });
+            return null;
         }
         if(command.kind=="shipAttack")
         {
             var otherRoot=FleetEngineBundle.RootFor(other)?.Buildable;
-            var targetBuilding=other.Buildables.FirstOrDefault(b=>b!=null&&b!=otherRoot&&!MoveConstructionCommands.IsStored(b));
-            if(targetBuilding!=null)
+            var targetBuilding=(clickedBuilding!=null&&clickedBuilding.Community==other&&clickedBuilding!=otherRoot&&!MoveConstructionCommands.IsStored(clickedBuilding))
+                ?clickedBuilding
+                :other.Buildables.FirstOrDefault(b=>b!=null&&b!=otherRoot&&!MoveConstructionCommands.IsStored(b));
+            var hitPos=targetBuilding!=null?targetBuilding.transform.position:otherPos;
+            FleetPhysicalActors.RecordAndSpawn("shipAttack","火炮齐射",actorPos,hitPos,onArriveTarget:()=>
             {
-                var nextHealth=Mathf.Max(0f,targetBuilding.Health-0.25f);
-                AccessTools.PropertySetter(typeof(Buildable),nameof(Buildable.Health)).Invoke(targetBuilding,new object[]{nextHealth});
-                if(targetBuilding.SpawnedVisual!=null)targetBuilding.SpawnedVisual.SetProgress(nextHealth);
-                if(nextHealth<=0.05f)targetBuilding.Salvage();
-                return null;
-            }
-            var heartEngine=FleetEngineBundle.HeartBuildable(other)?.GetComponent<Engine>();
-            heartEngine?.EnergyGrid?.RequestStorageEnergy(150f);
+                if(targetBuilding!=null)
+                {
+                    var nextHealth=Mathf.Max(0f,targetBuilding.Health-0.25f);
+                    AccessTools.PropertySetter(typeof(Buildable),nameof(Buildable.Health)).Invoke(targetBuilding,new object[]{nextHealth});
+                    if(targetBuilding.SpawnedVisual!=null)targetBuilding.SpawnedVisual.SetProgress(nextHealth);
+                    if(nextHealth<=0.05f)targetBuilding.Salvage();
+                    return;
+                }
+                var heartEngine=FleetEngineBundle.HeartBuildable(other)?.GetComponent<Engine>();
+                heartEngine?.EnergyGrid?.RequestStorageEnergy(150f);
+            });
             return null;
         }
         return "未知跨船操作";
     }
-    private int TransferItemsBetweenShips(Community from,Community to,string selector,int maxCount)
+    private static bool HasStealableItems(Community from)
     {
-        var moved=0;
         foreach(var building in from.Buildables)
         {
-            if(building==null||moved>=maxCount)break;
+            if(building==null)continue;
+            foreach(var section in building.Inventory.SubInventoryTypes)
+                foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()))
+                    if(item!=null&&!item.IsReserved)return true;
+        }
+        return false;
+    }
+    private static List<ItemProperties> ExtractItemsFromShip(Community from,string selector,int maxCount)
+    {
+        var extracted=new List<ItemProperties>();
+        foreach(var building in from.Buildables)
+        {
+            if(building==null||extracted.Count>=maxCount)break;
             foreach(var section in building.Inventory.SubInventoryTypes.ToArray())
             {
-                if(moved>=maxCount)break;
+                if(extracted.Count>=maxCount)break;
                 foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()).ToArray())
                 {
-                    if(moved>=maxCount)break;
+                    if(extracted.Count>=maxCount)break;
                     if(item==null||item.IsReserved)continue;
                     var p=item.Properties;
                     var match=string.IsNullOrEmpty(selector)
@@ -477,13 +523,10 @@ internal sealed class Replication
                         ||p.name==selector;
                     if(!match)continue;
                     if(building.Inventory.RemoveItem(p,section)!=null)
-                    {
-                        to.SpawnItemToAvailableStorage(p);
-                        moved++;
-                    }
+                        extracted.Add(p);
                 }
             }
         }
-        return moved;
+        return extracted;
     }
 }
