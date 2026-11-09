@@ -1233,14 +1233,24 @@ pub async fn check_launcher_update() -> Result<UpdateInfo> {
 
     let mut download_url = html_url.clone();
     if let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) {
-        if let Some(asset) = assets.iter().find(|a| {
-            a.get("name")
-                .and_then(|n| n.as_str())
-                .is_some_and(|n| {
-                    let lower = n.to_ascii_lowercase();
-                    lower.ends_with(".exe") || lower.ends_with(".zip")
+        let preferred = assets
+            .iter()
+            .find(|a| {
+                a.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| n.to_ascii_lowercase().ends_with("-setup.exe"))
+            })
+            .or_else(|| {
+                assets.iter().find(|a| {
+                    a.get("name")
+                        .and_then(|n| n.as_str())
+                        .is_some_and(|n| {
+                            let lower = n.to_ascii_lowercase();
+                            lower.ends_with(".msi") || lower.ends_with(".exe") || lower.ends_with(".zip")
+                        })
                 })
-        }) {
+            });
+        if let Some(asset) = preferred {
             if let Some(dl) = asset.get("browser_download_url").and_then(|u| u.as_str()) {
                 download_url = dl.to_string();
             }

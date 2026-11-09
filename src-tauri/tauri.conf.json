@@ -9,9 +9,17 @@
     "security":{"csp":"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost"}
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": ["nsis"],
     "publisher": "Flotsam Launcher Contributors",
-    "shortDescription": "Flotsam Community Desktop Launcher",
-    "icon": ["icons/icon.ico", "icons/icon.png"]
+    "shortDescription": "浮游 (Flotsam) 模组管理、存档守护与多船联机启动器",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "installMode": "currentUser"
+      }
+    }
   }
 }
