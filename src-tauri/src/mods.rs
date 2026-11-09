@@ -226,6 +226,7 @@ fn cached_metadata(path: &Path, meta: &fs::Metadata, cache: &mut MetadataCache) 
     value
 }
 pub(crate) fn scan(root: &Path, cache: &mut MetadataCache) -> Result<Vec<ModEntry>> {
+    crate::multiplayer::refresh_existing_plugin(root);
     scan_directory(
         &root.join("BepInEx/plugins"),
         root.join("BepInEx/core/BepInEx.dll").is_file(),

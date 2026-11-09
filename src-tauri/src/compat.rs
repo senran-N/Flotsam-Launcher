@@ -876,6 +876,7 @@ fn doorstop_config(root: &Path) -> DoorstopConfig {
 /// Inspect the local install without a network connection. Used by
 /// `join_room`/`host_room` before any handshake and by the settings UI.
 pub fn preflight(root: &Path) -> Result<Preflight> {
+    crate::multiplayer::refresh_existing_plugin(root);
     let manifest = build(root)?;
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();

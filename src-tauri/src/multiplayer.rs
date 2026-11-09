@@ -12,6 +12,8 @@ use std::{
 const PLUGIN: &[u8] = include_bytes!("../../multiplayer/payload/Flotsam.Multiplayer.dll");
 const LOADER: &[u8] = include_bytes!("../../multiplayer/payload/BepInEx.zip");
 const PLUGIN_PATH: &str = "BepInEx/plugins/Flotsam.Multiplayer/Flotsam.Multiplayer.dll";
+const DISABLED_PLUGIN_PATH: &str =
+    "BepInEx/plugins/Flotsam.Multiplayer/Flotsam.Multiplayer.dll.disabled";
 const LOADER_LICENSE: &str = include_str!("../../THIRD-PARTY/BepInEx-LICENSE.txt");
 
 fn supported(root: &Path) -> Result<()> {
@@ -28,7 +30,9 @@ pub(crate) fn loader_ready(root: &Path) -> bool {
 }
 
 pub(crate) fn installed(root: &Path) -> bool {
-    fs::read(root.join(PLUGIN_PATH)).is_ok_and(|bytes| bytes == PLUGIN) && loader_ready(root)
+    !root.join(DISABLED_PLUGIN_PATH).exists()
+        && fs::read(root.join(PLUGIN_PATH)).is_ok_and(|bytes| bytes == PLUGIN)
+        && loader_ready(root)
 }
 
 pub(crate) fn ensure_loader_under_lock(
@@ -170,7 +174,20 @@ fn publish_loader(
     Ok(())
 }
 
+pub(crate) fn refresh_existing_plugin(root: &Path) {
+    let dir = root.join("BepInEx/plugins/Flotsam.Multiplayer");
+    if dir.is_dir() && !installed(root) {
+        let _ = publish_plugin(root, || Ok(()));
+    }
+}
+
 fn publish_plugin(root: &Path, check: impl Fn() -> Result<()>) -> Result<()> {
+    let disabled = root.join(DISABLED_PLUGIN_PATH);
+    crate::packages::boundary(root, &disabled)?;
+    if disabled.is_file() {
+        check()?;
+        fs::remove_file(&disabled).map_err(err)?;
+    }
     let target = root.join(PLUGIN_PATH);
     if fs::read(&target).is_ok_and(|old| old == PLUGIN) {
         return Ok(());
