@@ -571,7 +571,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(bundled.plugins[0].id, "local.flotsam.multiplayer");
-        assert!(!bundled.plugins[0].version.is_empty());
+        assert!(version(&bundled.plugins[0].version).is_some());
     }
     #[test]
     fn identifies_missing_disabled_and_old_dependencies_but_allows_absent_optional() {
