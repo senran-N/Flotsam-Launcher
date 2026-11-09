@@ -230,6 +230,28 @@ public static class FleetRuntime
             .GetSetMethod(true)?.Invoke(null, new object[] { community });
     }
 
+    internal readonly struct PlayerCommunityScope : IDisposable
+    {
+        private readonly Community? _previous;
+        private readonly bool _changed;
+        public PlayerCommunityScope(Community? target)
+        {
+            _previous = Community.PlayerCommunity;
+            if (target != null && _previous != null && !ReferenceEquals(target, _previous))
+            {
+                SetPlayerCommunity(target);
+                _changed = true;
+            }
+            else _changed = false;
+        }
+        public void Dispose()
+        {
+            if (_changed && _previous != null) SetPlayerCommunity(_previous);
+        }
+    }
+
+    internal static PlayerCommunityScope WithPlayerCommunity(Community? target) => new PlayerCommunityScope(target);
+
     private static void RebindRestoredShips()    {
         foreach (var c in Community.Communities)
         {

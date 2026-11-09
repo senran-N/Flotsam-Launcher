@@ -48,12 +48,14 @@ internal static class NavigationReplication
             case "mapOpen":LiveNavigation.Ensure();return null;
             case "mapClose":LiveNavigation.Stop();map.ClearMouseMovementTarget();map.StopAllMovement();return null;
             case "navigate":
-                if(!map.isActiveAndEnabled||map.IsTownMovementBlocked)return "房主海图尚未就绪";
+                LiveNavigation.Ensure();
+                if(!map.isActiveAndEnabled||map.IsTownMovementBlocked)return "当前船只引擎冷却或电力不足，暂时无法航行";
                 if(!Enum.IsDefined(typeof(MouseMovementCursorProperties.Gear),command.value))return "航行方向无效";
                 if((map.Townheart.transform.position-new Vector3(command.x,0,command.z)).sqrMagnitude>100000000)return "航行目标过远";
                 LiveNavigation.MouseInput();map.SetMouseMovementTarget(new Vector3(command.x,0,command.z),(MouseMovementCursorProperties.Gear)command.value);return null;
             case "navigateKeys":
-                if(!map.isActiveAndEnabled||map.IsTownMovementBlocked)return "房主海图尚未就绪";
+                LiveNavigation.Ensure();
+                if(!map.isActiveAndEnabled||map.IsTownMovementBlocked)return "当前船只引擎冷却或电力不足，暂时无法航行";
                 if(Math.Abs(command.x)>1||Math.Abs(command.z)>1)return "航行输入无效";
                 LiveNavigation.KeyInput(new Vector2(command.x,command.z));return null;
             case "navigateStop":LiveNavigation.Stop();map.ClearMouseMovementTarget();map.StopAllMovement();return null;

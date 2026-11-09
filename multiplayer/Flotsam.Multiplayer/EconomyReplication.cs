@@ -43,8 +43,18 @@ internal sealed class EconomyReplication
         if(research==null)return new ResearchState();
         return new ResearchState{current=research.CurrentResearch?.Guid??"",progresses=research.ResearchProgresses.Select(r=>new ResearchProgress{guid=r.Guid,progress=r.Progress}).ToArray()};
     }
-    public string[] UnlockedTech(){Catalog();return _tech.Values.Where(n=>n.IsUnlocked()).Select(n=>n.Guid).OrderBy(s=>s,StringComparer.Ordinal).ToArray();}
-    public string[] ResearchableTech(){Catalog();return _tech.Values.Where(n=>n.IsResearchable()).Select(n=>n.Guid).OrderBy(s=>s,StringComparer.Ordinal).ToArray();}
+    public string[] UnlockedTech(Community? owner=null)
+    {
+        Catalog();
+        using var _=FleetRuntime.WithPlayerCommunity(owner);
+        return _tech.Values.Where(n=>n.IsUnlocked()).Select(n=>n.Guid).OrderBy(s=>s,StringComparer.Ordinal).ToArray();
+    }
+    public string[] ResearchableTech(Community? owner=null)
+    {
+        Catalog();
+        using var _=FleetRuntime.WithPlayerCommunity(owner);
+        return _tech.Values.Where(n=>n.IsResearchable()).Select(n=>n.Guid).OrderBy(s=>s,StringComparer.Ordinal).ToArray();
+    }
     private static void Set(object instance,string property,object? value)=>AccessTools.Field(instance.GetType(),"<"+property+">k__BackingField").SetValue(instance,value);
     public void Apply(Buildable building,ProducerState? state)
     {
@@ -81,8 +91,10 @@ internal sealed class EconomyReplication
     public void ApplyResearch(ResearchState state,string[] unlocked,Community? owner=null)
     {
         Catalog();if(state.progresses.Length>2048||unlocked.Length>2048)throw new InvalidOperationException("Research state exceeds limit");
-        foreach(var key in unlocked)if(_tech.TryGetValue(key,out var node)&&!node.IsUnlocked())node.Unlock();
-        var research=(owner??Community.PlayerCommunity)?.Research;
+        var target=owner??Community.PlayerCommunity;
+        var isLocalPlayer=ReferenceEquals(target,Community.PlayerCommunity);
+        if(isLocalPlayer)foreach(var key in unlocked)if(_tech.TryGetValue(key,out var node)&&!node.IsUnlocked())node.Unlock();
+        var research=target?.Research;
         if(research==null)return;
         var progresses=new List<CommunityResearch.Research>();var ids=new HashSet<string>();
         foreach(var progress in state.progresses)
@@ -103,8 +115,10 @@ internal sealed class EconomyReplication
     }
     public string? ExecuteGlobal(GameCommand command,Community? owner=null)
     {
-        Catalog();var research=(owner??Community.PlayerCommunity)?.Research;
+        Catalog();var target=owner??Community.PlayerCommunity;
+        var research=target?.Research;
         if(research==null)return "当前船只研究组件未就绪";
+        using var _=FleetRuntime.WithPlayerCommunity(target);
         if(command.kind=="researchStart")
         {
             if(!_tech.TryGetValue(command.text,out var node)||!node.IsResearchable())return "研究前置条件不满足";

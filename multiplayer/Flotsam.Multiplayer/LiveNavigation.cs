@@ -138,7 +138,7 @@ internal static class LiveNavigation
     {
         var physics=__instance;
         if(_map==null||Network?.IsHost!=true)return true;
-        if(Network.IsCaptain)return _viewOpen;
+        if(Network.IsCaptain&&(_viewOpen||_remoteMode==0))return _viewOpen;
         if(_remoteMode==2)
         {
             AccessTools.Method(typeof(WorldMapTownheartPhycis2D),"ApplyMovementAndRotation").Invoke(physics,new object[]{_remoteKeys.y*_map.MovementSpeed,-_remoteKeys.x*_map.RotationSpeed});

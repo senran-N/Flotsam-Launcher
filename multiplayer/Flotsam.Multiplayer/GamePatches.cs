@@ -57,13 +57,50 @@ internal static class GamePatches
         harmony.Patch(AccessTools.Method(typeof(WorldMapTownheartPhycis2D),"MoveWithKeys"),prefix:new HarmonyMethod(typeof(GamePatches),nameof(CanSteer)));
         harmony.Patch(AccessTools.PropertySetter(typeof(Buildable),nameof(Buildable.Name)),prefix:new HarmonyMethod(typeof(GamePatches),nameof(Rename)));
         harmony.Patch(AccessTools.PropertySetter(typeof(Buildable),nameof(Buildable.AssignmentLimit)),prefix:new HarmonyMethod(typeof(GamePatches),nameof(Assignment)));
-        harmony.Patch(AccessTools.Method(typeof(GameSpeedManager),"SetGameSpeedAndTimeScale"),postfix:new HarmonyMethod(typeof(GamePatches),nameof(Freeze)));
+        var moorBoat=AccessTools.DeclaredMethod(typeof(BoatCursorProperties),"<UpdateCursor>g__MoorBoat|5_0");
+        if(moorBoat!=null)harmony.Patch(moorBoat,prefix:new HarmonyMethod(typeof(GamePatches),nameof(PlaceBoat)));
+        var energyConnect=AccessTools.DeclaredMethod(typeof(EnergyGridConnectCursorProperties),"Connect");
+        if(energyConnect!=null)harmony.Patch(energyConnect,prefix:new HarmonyMethod(typeof(GamePatches),nameof(ConnectEnergy)));
+        foreach(var disconnect in AccessTools.GetDeclaredMethods(typeof(EnergyGridBuildableComponent)))
+            if(disconnect.Name=="Disconnect"&&disconnect.GetParameters().Length==1)
+                harmony.Patch(disconnect,prefix:new HarmonyMethod(typeof(GamePatches),nameof(DisconnectEnergy)));
         // A client replica never writes an authoritative save or triggers auto-save achievements.
         foreach(var method in AccessTools.GetDeclaredMethods(typeof(PlayerRun)))if(method.Name=="Save")harmony.Patch(method,prefix:new HarmonyMethod(typeof(GamePatches),nameof(CanSave)));
     }
     private static bool Simulate()=>!Client;
     private static bool CanSave()=>Network?.IsClient!=true;
-    private static void Freeze(){if(Client)UnityEngine.Time.timeScale=0;}
+    private static bool PlaceBoat(BoatCursorProperties __instance,MooringPoint mooringPoint)
+    {
+        if(!Client)return true;
+        var boat=(Boat)AccessTools.Field(typeof(BoatCursorProperties),"_boat").GetValue(__instance);
+        var visual=(int)AccessTools.Field(typeof(BuildableCursorProperties),"_visualIndex").GetValue(__instance);
+        if(boat?.Buildable?.Properties!=null&&mooringPoint?.Buildable!=null)
+        {
+            Network!.Submit(new GameCommand{kind="placeBoat",properties=boat.Buildable.Properties.name,target=Network.Id(mooringPoint.Buildable),visual=visual});
+            if(!RewiredActions.IsContinuousBuilding())GameManager.CursorManager.Deactivate();
+        }
+        return false;
+    }
+    private static bool ConnectEnergy(EnergyGridConnectCursorProperties __instance,EnergyGridConnector other,CursorManager cursor)
+    {
+        if(!Client)return true;
+        var src=AccessTools.Field(typeof(EnergyGridConnectCursorProperties),"_component").GetValue(__instance) as EnergyGridBuildableComponent;
+        var withIndex=(bool)AccessTools.Field(typeof(EnergyGridConnectCursorProperties),"_connectWithIndex").GetValue(__instance);
+        var idx=(uint)AccessTools.Field(typeof(EnergyGridConnectCursorProperties),"_componentConnectIndex").GetValue(__instance);
+        if(src?.Buildable!=null&&other is EnergyGridBuildableComponent dst&&dst.Buildable!=null)
+        {
+            Network!.Submit(new GameCommand{kind="energyConnect",target=Network.Id(src.Buildable),reference=Network.Id(dst.Buildable),value=withIndex?(int)idx:-1});
+            cursor.Deactivate();
+        }
+        return false;
+    }
+    private static bool DisconnectEnergy(EnergyGridBuildableComponent __instance,EnergyGridConnector other)
+    {
+        if(!Client)return true;
+        if(__instance?.Buildable!=null&&other is EnergyGridBuildableComponent dst&&dst.Buildable!=null)
+            Network!.Submit(new GameCommand{kind="energyDisconnect",target=Network.Id(__instance.Buildable),reference=Network.Id(dst.Buildable)});
+        return false;
+    }
     private static bool BuildingAction(Buildable __instance,MethodBase __originalMethod)
     {
         if(!Client)return true;

@@ -55,6 +55,7 @@ internal static class ConstructionCommands
     internal static string? Execute(GameCommand command,IReadOnlyDictionary<string,BuildableProperties> properties,IReadOnlyDictionary<long,Buildable> buildings,Community? owner=null)
     {
         var community=owner??Community.PlayerCommunity;
+        using var _scope=FleetRuntime.WithPlayerCommunity(community);
         var heartPos=FleetEngineBundle.RootFor(community)?.transform.position??Construction.TownheartPosition;
         if(!properties.TryGetValue(command.properties,out var p)||p.Prefab==null||!GameSettings.Instance.BuildableSettings.Buildables.Contains(p))return "道路类型不存在";
         if(p.PlacementCursorProperties==null||p.PlacementCursorProperties.GetType()!=LineType||!p.Prefab.TryGetComponent<Hookable>(out _))return "此类型不是已适配的原生道路";

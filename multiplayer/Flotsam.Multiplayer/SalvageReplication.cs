@@ -11,11 +11,12 @@ namespace Flotsam.Multiplayer;
 internal sealed class SalvageReplication
 {
     private readonly Dictionary<long,Debris> _flotsam=new Dictionary<long,Debris>();
+    private readonly Dictionary<long,(Vector3 pos,Quaternion rot)> _flotsamTargets=new Dictionary<long,(Vector3,Quaternion)>();
     private readonly Dictionary<long,Marker> _markers=new Dictionary<long,Marker>();
     private readonly Dictionary<string,MarkerCursorProperties> _cursors=new Dictionary<string,MarkerCursorProperties>(StringComparer.Ordinal);
     private readonly Dictionary<string,FlotsamProperties> _properties=new Dictionary<string,FlotsamProperties>(StringComparer.Ordinal);
     private readonly Dictionary<string,ItemProperties> _items=new Dictionary<string,ItemProperties>(StringComparer.Ordinal);
-    public void Reset(){_flotsam.Clear();_markers.Clear();_cursors.Clear();_properties.Clear();_items.Clear();}
+    public void Reset(){_flotsam.Clear();_flotsamTargets.Clear();_markers.Clear();_cursors.Clear();_properties.Clear();_items.Clear();}
     private void Catalog()
     {
         if(_cursors.Count!=0)return;
@@ -67,11 +68,14 @@ internal sealed class SalvageReplication
                 (AccessTools.Field(typeof(FlotsamInventory),"_composition").GetValue(f.Inventory) as CompositionInventory)?.Clear();
                 f.InitializeComposition(new CompositionInventory(items));
             }
-            f.UpdatePositionAndRotation(new Vector3(state.x,state.y,state.z),Quaternion.Euler(0,state.rotation,0));f.StopAllCoroutines();
+            var targetPos=new Vector3(state.x,state.y,state.z);var targetRot=Quaternion.Euler(0,state.rotation,0);
+            if(!_flotsamTargets.ContainsKey(state.id)||(f.transform.position-targetPos).sqrMagnitude>400f)f.UpdatePositionAndRotation(targetPos,targetRot);
+            _flotsamTargets[state.id]=(targetPos,targetRot);
+            f.StopAllCoroutines();
             foreach(var body in f.GetComponentsInChildren<Rigidbody>())body.isKinematic=true;
             if(f.VisualPrefab!=null)f.VisualPrefab.SetProgress(state.progress);
         }
-        foreach(var pair in _flotsam.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null&&!pair.Value.Pooled)pair.Value.SafelyDestroy();_flotsam.Remove(pair.Key);}
+        foreach(var pair in _flotsam.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null&&!pair.Value.Pooled)pair.Value.SafelyDestroy();_flotsam.Remove(pair.Key);_flotsamTargets.Remove(pair.Key);}
         var authoritative=new HashSet<Debris>(_flotsam.Values);
         foreach(var local in GameManager.WorldManager.FlotsamInWorld.ToArray())if(local!=null&&!authoritative.Contains(local))local.SafelyDestroy();
         var markerUsed=new HashSet<Marker>(_markers.Values);alive.Clear();
@@ -94,6 +98,17 @@ internal sealed class SalvageReplication
         foreach(var pair in _markers.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null){if(pair.Value.Project!=null)pair.Value.Project.Stop(ProjectFlags.Cancelled);else UnityEngine.Object.Destroy(pair.Value.gameObject);}_markers.Remove(pair.Key);}
     }
     private static ProjectProperties Project(MarkerCursorProperties cursor)=>(ProjectProperties)AccessTools.Field(typeof(MarkerCursorProperties),"_projectProperties").GetValue(cursor);
+    public void Interpolate(float dt)
+    {
+        var t=Mathf.Clamp01(dt*12f);
+        foreach(var pair in _flotsamTargets)
+        {
+            if(!_flotsam.TryGetValue(pair.Key,out var f)||f==null||f.Pooled)continue;
+            var cur=f.transform.position;
+            if((cur-pair.Value.pos).sqrMagnitude>0.0001f||Quaternion.Angle(f.transform.rotation,pair.Value.rot)>0.1f)
+                f.UpdatePositionAndRotation(Vector3.Lerp(cur,pair.Value.pos,t),Quaternion.Slerp(f.transform.rotation,pair.Value.rot,t));
+        }
+    }
     public string? Execute(GameCommand command,Community? actorCommunity=null)
     {
         Catalog();

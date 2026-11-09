@@ -62,6 +62,10 @@ internal sealed class GameSession:IDisposable
     public FleetShipState[] Ships {get;private set;}=Array.Empty<FleetShipState>();
     public CommandResult? LastResult;
     internal CommandResult? LastRejected;
+    public string NoticeText {get;private set;}="";
+    public bool NoticeError {get;private set;}
+    public float NoticeUntil {get;private set;}
+    public void ShowNotice(string text,bool isError=false){if(string.IsNullOrWhiteSpace(text))return;NoticeText=text;NoticeError=isError;NoticeUntil=Time.realtimeSinceStartup+3.6f;}
     public GameSession(NetConfig options)
     {
         _options=options;
@@ -169,7 +173,7 @@ internal sealed class GameSession:IDisposable
             case "ping":return;
             case "world":if(packet.world!=null)Interlocked.Exchange(ref _incomingWorld,packet.world);break;
             case "bootstrap":Interlocked.Exchange(ref _incomingWorld,null);Plugin.Log($"bootstrap received from {connection.Peer}");_main.Enqueue(()=>{_canSubmit=false;_pendingBootstrap=packet;});break;
-            case "result":_main.Enqueue(()=>{LastResult=packet.result;if(packet.result?.accepted==false)LastRejected=packet.result;});break;
+            case "result":_main.Enqueue(()=>{LastResult=packet.result;if(packet.result?.accepted==false){LastRejected=packet.result;ShowNotice(packet.result.error,true);}});break;
             case "error":_main.Enqueue(()=>Status=packet.error);break;
             default:connection.Dispose();break;
         }
@@ -232,13 +236,14 @@ internal sealed class GameSession:IDisposable
         if(incoming!=null&&incoming.epoch==_epoch&&(_latest==null||incoming.sequence>_latest.sequence))_latest=incoming;
         if(IsHost&&now>=_nextSnapshot)
         {
-            _nextSnapshot=now+.25f;
+            _nextSnapshot=now+.10f;
             RefreshWorld();
             foreach(var member in _crew.Members())if(!member.host&&!_peers.ContainsKey(member.id)){if(_crew.Leave(member.id))StopNavigation();if(_options.mode=="independent"){var ship=FleetEngineBundle.FindShipById(member.id);if(ship!=null)FleetOwnedNavigation.Stop(ship);}_ledger.Forget(member.id);}
             _bootstrapped.RemoveWhere(peer=>!_peers.ContainsKey(peer));
             foreach(var peer in _resyncAfter.Keys.ToArray())if(!_peers.ContainsKey(peer))_resyncAfter.Remove(peer);
             foreach(var peer in _peers.Values)if(!_bootstrapped.Contains(peer.Peer))SendBootstrap(peer);
             if(_peers.Count>0){var broadcast=new Packet{type="world",world=CaptureFrame()};foreach(var peer in _peers.Values)if(_bootstrapped.Contains(peer.Peer))peer.Send(broadcast);}
+            else Ships=CaptureFleetSummary();
             Status=($"{(_options.mode=="independent"?"独立船队":"共建模式")} · {_peers.Count+1} 位玩家");
         }
         if(IsClient&&_latest!=null)
@@ -248,11 +253,37 @@ internal sealed class GameSession:IDisposable
             // community to the local player community once the replica is live.
             if(!_adopted&&_options.mode=="independent"&&!_localShip.Equals(""))_adopted=FleetRuntime.AdoptLocalShip(_localShip);
         }
-        if(IsClient&&ReplicaReady)Time.timeScale=0;
+        if(IsClient&&ReplicaReady)
+        {
+            if(Time.timeScale==0f&&GameSpeedManager.GameSpeed!=GameSpeed.Zero)Time.timeScale=1f;
+            _replication.Interpolate(Time.unscaledDeltaTime);
+        }
     }
     private void RefreshWorld(){if(ReferenceEquals(_hostWorld,GameManager.WorldManager.World))return;_hostWorld=GameManager.WorldManager.World;_epoch=Guid.NewGuid().ToString("N");_replication.Reset();_bootstrapped.Clear();}
     private void AddCrew(WorldFrame frame){frame.epoch=_epoch;frame.captain=Captain;frame.crew=Crew;}
     private WorldFrame CaptureFrame(){var frame=_replication.Capture(++_sequence);AddCrew(frame);Ships=frame.ships;return frame;}
+    private FleetShipState[] CaptureFleetSummary()
+    {
+        var primary=Community.PlayerCommunity;
+        if(primary==null)return Array.Empty<FleetShipState>();
+        var list=new List<Community>{primary};
+        foreach(var sec in FleetEngineBundle.SecondaryCommunities)if(sec!=null)list.Add(sec);
+        return list.Select(owner=>{
+            var isPrimary=ReferenceEquals(owner,primary);
+            var root=FleetEngineBundle.RootFor(owner)??(isPrimary?Construction.Townheart:null);
+            var pos=root!=null?root.transform.position:Vector3.zero;
+            return new FleetShipState{
+                name=owner.Name??"",
+                peerId=isPrimary?"host":FleetEngineBundle.OwnerIdOf(owner),
+                ownerName=isPrimary?(string.IsNullOrWhiteSpace(_options.nickname)?"房主":_options.nickname):FleetRuntime.ExtractShipOwnerName(owner.Name),
+                x=pos.x,z=pos.z,rotation=root!=null?root.transform.eulerAngles.y:0f,
+                energy=FleetEngineBundle.EnergyOf(owner),
+                buildings=owner.Buildables.Count(b=>b!=null),
+                agents=owner.Agents.Count(a=>a!=null),
+                researchPoints=owner.Research?.ResearchPoints??0
+            };
+        }).ToArray();
+    }
     private string? ExecuteAuthorized(string peer,GameCommand command)
     {
         if(_options.mode=="independent"&&peer!=_peer)
@@ -271,14 +302,25 @@ internal sealed class GameSession:IDisposable
         if(command.kind=="captainTransfer"){error=_crew.Transfer(peer,command.text);if(error==null)StopNavigation();return error;}
         Applying=true;try{return _replication.Execute(command);}finally{Applying=false;}
     }
-    public void ExecuteOrSubmit(GameCommand command)
+    public void ExecuteOrSubmit(GameCommand command,string? successNotice=null)
     {
         if(IsHost)
         {
             var error=ExecuteAuthorized(_peer,command);
             LastResult=new CommandResult{accepted=error==null,error=error??""};
+            if(error==null)
+            {
+                if(command.kind=="navigate"||command.kind=="navigateKeys")_navigationUntil=Time.realtimeSinceStartup+1.2f;
+                else if(command.kind=="navigateStop")_navigationUntil=0f;
+                if(!string.IsNullOrEmpty(successNotice))ShowNotice(successNotice!,false);
+            }
+            else ShowNotice(error,true);
         }
-        else Submit(command);
+        else
+        {
+            Submit(command);
+            if(!string.IsNullOrEmpty(successNotice))ShowNotice(successNotice!,false);
+        }
     }
     private void StopNavigation(){LiveNavigation.Stop();if(!Ready())return;var previous=Applying;Applying=true;try{_navigationUntil=0;GameManager.WorldMapManager.WorldMap.ClearMouseMovementTarget();GameManager.WorldMapManager.WorldMap.StopAllMovement();}finally{Applying=previous;}}
     public void TransferCaptain(string peer){if(IsHost){var error=ExecuteAuthorized(_peer,new GameCommand{kind="captainTransfer",text=peer});LastResult=new CommandResult{accepted=error==null,error=error??""};}else Submit(new GameCommand{kind="captainTransfer",text=peer});}

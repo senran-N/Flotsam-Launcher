@@ -55,6 +55,7 @@ public sealed class FleetShipState
     public float x,z,rotation,mapX,mapZ,mapRotation,energy;
     public int buildings,agents,researchPoints;
     public string[] researched=Array.Empty<string>();
+    public string[] unlockedTech=Array.Empty<string>();
     public ResearchState research=new ResearchState();
 }
 public sealed class BuildingState
@@ -68,6 +69,8 @@ public sealed class BuildingState
     public ItemCount[] inventory=Array.Empty<ItemCount>();
     public ProducerState? producer;
     public long[] neighbours=Array.Empty<long>();
+    public long[] energyLinks=Array.Empty<long>();
+    public long mooredTo;
     public PointState[] outline=Array.Empty<PointState>();
     public WalkwayState? walkway;
 }

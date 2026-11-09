@@ -72,14 +72,14 @@ public static class FleetOwnedNavigation
         forward.Normalize();
         var right = new Vector3(forward.z, 0f, -forward.x);
 
-        var effectiveThrottle = Mathf.Abs(throttle) > 0.05f ? throttle : 0.35f;
-        var direction = (forward * effectiveThrottle + right * (turn * 0.75f)).normalized;
-        var target = heart.transform.position + direction * 35f;
+        var effectiveThrottle = Mathf.Abs(throttle) > 0.05f ? throttle : 0.45f;
+        var direction = (forward * effectiveThrottle + right * (turn * 0.85f)).normalized;
+        var target = heart.transform.position + direction * 45f;
         Goals[owner] = new NavGoal
         {
             Target = new Vector3(target.x, heart.transform.position.y, target.z),
             Speed = Mathf.Clamp(speed, 0.5f, 20f),
-            Expires = Time.realtimeSinceStartup + 1.1f
+            Expires = Time.realtimeSinceStartup + 1.4f
         };
         return true;
     }
@@ -112,7 +112,7 @@ public static class FleetOwnedNavigation
             delta.y = 0f;
             if (delta.sqrMagnitude <= 0.02f) { Goals.Remove(owner); continue; }
 
-            var step = Mathf.Min(Mathf.Min(goal.Speed * deltaTime, 0.35f), delta.magnitude);
+            var step = Mathf.Min(Mathf.Min(goal.Speed * deltaTime, 2.0f), delta.magnitude);
             var cost = owner.Engine != null ? owner.Engine.ReturnEnergyCost(step) : 0f;
             if (!EnergyDevTools.FreeMovement && FleetEngineBundle.EnergyOf(owner) < cost) { Goals.Remove(owner); continue; }
 

@@ -17,8 +17,7 @@ public sealed class Plugin : BaseUnityPlugin
     private Harmony? _harmony;
     private float _nextReport;
     private bool _started;
-    private bool _showCrew;
-    private bool _hudCollapsed;
+    private FleetHud? _hud;
     internal GameSession? Network;
     internal string Status = "初始化";
     internal static string ReportRoot = "";
@@ -61,6 +60,7 @@ public sealed class Plugin : BaseUnityPlugin
             if (Options.mode == "independent") FleetRuntime.Install(_harmony);
             GamePatches.Install(_harmony);
             Network = new GameSession(Options);
+            _hud = FleetHud.Attach(gameObject);
             Status = "等待游戏会话";
             Logger.LogInfo($"Multiplayer {Options.role} ({Options.mode}); profile: {Options.profile}");
         }
@@ -102,7 +102,6 @@ public sealed class Plugin : BaseUnityPlugin
     {
         try
         {
-            if (Input.GetKeyDown(KeyCode.F8)) _hudCollapsed = !_hudCollapsed;
             var menu = Options.autoStart && Options.role != "client" && !_started ? UnityEngine.Object.FindAnyObjectByType<MainMenu>() : null;
             if (menu != null && Session.IsReady && Session.Profile != null && !LoadingScreen.IsLoading)
             {
@@ -163,112 +162,6 @@ public sealed class Plugin : BaseUnityPlugin
     {
         try { LiveNavigation.Commit(); }
         catch (Exception e) { Logger.LogError(e); }
-    }
-
-    private static void FocusCameraOn(float x, float z)
-    {
-        try
-        {
-            var cam = CameraController.Instance;
-            if (cam == null) return;
-            var pos = cam.transform.position;
-            cam.transform.position = new Vector3(x, pos.y, z);
-        }
-        catch { }
-    }
-
-    private void OnGUI()
-    {
-        if (_hudCollapsed)
-        {
-            if (GUI.Button(new Rect(14, 14, 136, 30), "⚓ 联机面板 (F8)")) _hudCollapsed = false;
-            return;
-        }
-        var ships = Network?.Ships ?? Array.Empty<FleetShipState>();
-        var isIndependent = Options.mode == "independent";
-        var baseHeight = isIndependent ? 235 + Math.Max(1, ships.Length) * 58 : (_showCrew ? 210 + 34 * (Network?.Crew.Length ?? 0) : 190);
-        GUILayout.BeginArea(new Rect(14, 14, 380, Mathf.Min(baseHeight, Screen.height - 28)), GUI.skin.box);
-
-        GUILayout.BeginHorizontal();
-        GUILayout.Label(isIndependent ? $"⚓ 浮游独立船队 ({Math.Max(1, ships.Length)} 艘船)" : "⚓ 浮游共建单船");
-        if (GUILayout.Button("收起 F8", GUILayout.Width(68))) _hudCollapsed = true;
-        GUILayout.EndHorizontal();
-
-        GUILayout.Label(Network?.Status ?? Status);
-
-        if (Network != null && GameSession.Ready())
-        {
-            if (!isIndependent)
-            {
-                var captain = Network.Crew.FirstOrDefault(m => m.id == Network.Captain);
-                GUILayout.Label("当前掌舵船长：" + (captain?.name ?? "等待同步"));
-                if ((Network.IsHost || Network.IsCaptain) && GUILayout.Button(_showCrew ? "收起成员列表" : "移交船长权限"))
-                    _showCrew = !_showCrew;
-                if (_showCrew)
-                    foreach (var member in Network.Crew)
-                        if (member.id != Network.Captain && GUILayout.Button("移交给 " + member.name))
-                            Network.TransferCaptain(member.id);
-            }
-            else
-            {
-                var r = Options.rules;
-                GUILayout.Label($"规则：交易{(r.trading ? "✓" : "✕")} · 掠夺{(r.stealing ? "✓" : "✕")} · 破坏{(r.sabotage ? "✓" : "✕")} · 交火{(r.friendlyFire ? "✓" : "✕")}");
-
-                var localName = Community.PlayerCommunity?.Name ?? "";
-                var myShip = ships.FirstOrDefault(s => s.name == localName);
-
-                GUILayout.BeginHorizontal();
-                if (GUILayout.Button("定位我方船只"))
-                {
-                    if (myShip != null) FocusCameraOn(myShip.x, myShip.z);
-                    else CameraController.Instance?.CenterOnTownheart();
-                }
-                if (Options.role == "client")
-                {
-                    if (GUILayout.Button("◀左舵", GUILayout.Width(52))) Network.Submit(new GameCommand { kind = "navigateKeys", x = -1f, z = 0.8f, value = 1 });
-                    if (GUILayout.Button("▲前进", GUILayout.Width(52))) Network.Submit(new GameCommand { kind = "navigateKeys", x = 0f, z = 1f, value = 1 });
-                    if (GUILayout.Button("■停船", GUILayout.Width(52))) Network.Submit(new GameCommand { kind = "navigateStop" });
-                    if (GUILayout.Button("▶右舵", GUILayout.Width(52))) Network.Submit(new GameCommand { kind = "navigateKeys", x = 1f, z = 0.8f, value = 1 });
-                }
-                GUILayout.EndHorizontal();
-
-                foreach (var ship in ships)
-                {
-                    var isMine = ship.name == localName;
-                    var dist = myShip != null && !isMine ? Mathf.RoundToInt(Vector2.Distance(new Vector2(myShip.x, myShip.z), new Vector2(ship.x, ship.z))) : 0;
-                    GUILayout.BeginVertical(GUI.skin.box);
-                    GUILayout.BeginHorizontal();
-                    GUILayout.Label($"{(isMine ? "★ " : "")}{ship.ownerName} ({ship.agents}人/{ship.buildings}建/⚡{Mathf.RoundToInt(ship.energy)}{(isMine ? "" : $" · {dist}m")})");
-                    if (!isMine && GUILayout.Button("观察", GUILayout.Width(46))) FocusCameraOn(ship.x, ship.z);
-                    GUILayout.EndHorizontal();
-
-                    if (!isMine)
-                    {
-                        GUILayout.BeginHorizontal();
-                        if (r.trading)
-                        {
-                            if (GUILayout.Button("赠木×5")) Network.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = ship.name, properties = "Wood", amount = 5 });
-                            if (GUILayout.Button("赠塑×5")) Network.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = ship.name, properties = "Plastic", amount = 5 });
-                            if (GUILayout.Button("赠食水"))
-                            {
-                                Network.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = ship.name, properties = "Food", amount = 3 });
-                                Network.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = ship.name, properties = "Drink", amount = 3 });
-                            }
-                        }
-                        if (r.stealing && GUILayout.Button("掠夺"))
-                            Network.ExecuteOrSubmit(new GameCommand { kind = "shipSteal", text = ship.name, amount = 3 });
-                        if (r.friendlyFire && GUILayout.Button("开火"))
-                            Network.ExecuteOrSubmit(new GameCommand { kind = "shipAttack", text = ship.name });
-                        GUILayout.EndHorizontal();
-                    }
-                    GUILayout.EndVertical();
-                }
-            }
-        }
-        if (Network?.LastResult != null && !Network.LastResult.accepted && !string.IsNullOrEmpty(Network.LastResult.error))
-            GUILayout.Label("提示：" + Network.LastResult.error);
-        if (Options.role == "client" && GUILayout.Button("重新同步世界")) Network?.Resync();
-        GUILayout.EndArea();
     }
 }
 
