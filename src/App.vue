@@ -10,7 +10,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useLauncher } from './store';
 import { command, desktop, errorText } from './bridge';
 import { t } from './i18n';
-import type { DisplayMode, DownloadTask, Language, ModEntry, ModPackage, Page, RemovedPackage, SaveEntry, Settings } from './types';
+import type { DisplayMode, DownloadTask, Language, ModEntry, ModPackage, Page, RemovedPackage, SaveEntry, Settings, UpdateInfo } from './types';
 import OnlineMods from './components/OnlineMods.vue';
 import RoomPanel from './components/RoomPanel.vue';
 import LocalMod from './components/LocalMod.vue';
@@ -32,6 +32,39 @@ const downloadsDrawer = ref(false);
 const removedDrawer = ref(false);
 const inspectedModFile = ref<string | null>(null);
 const inspectedSaveFolder = ref<string | null>(null);
+const updateInfo = ref<UpdateInfo | null>(null);
+const checkingUpdate = ref(false);
+
+async function checkUpdate(silent = false) {
+  if (checkingUpdate.value) return;
+  checkingUpdate.value = true;
+  try {
+    const info = await command<UpdateInfo>('check_launcher_update');
+    updateInfo.value = info;
+    if (!silent) {
+      if (info.hasUpdate) {
+        store.notify(t('settings.updateFound', { version: info.latestVersion }), 'info');
+      } else {
+        store.notify(t('settings.upToDate', { version: info.currentVersion }), 'success');
+      }
+    }
+  } catch (e) {
+    if (!silent) store.notify(errorText(e), 'error');
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
+
+function openGithub(url?: string) {
+  const target = url || updateInfo.value?.releaseUrl || 'https://github.com/senran-N/Flotsam-Launcher/releases';
+  if (!desktop) {
+    window.open(target, '_blank', 'noopener,noreferrer');
+    return;
+  }
+  command('open_github_url', { url: target }).catch((e) => {
+    store.notify(errorText(e), 'error');
+  });
+}
 
 const draft = ref<Settings>({
   gamePath: 'D:\\\\Epic Games\\\\Flotsam',
@@ -125,6 +158,7 @@ onMounted(async () => {
   await store.refresh();
   await store.loadTasks();
   if (desktop && !unmounted) {
+    void checkUpdate(true);
     try {
       const off = await listen<DownloadTask[]>('download-queue', (event) => {
         void store.queueChanged(event.payload);
@@ -708,13 +742,22 @@ function open(kind: string, subpath?: string) {
 
             <div class="setting-row">
               <div class="setting-info">
-                <h2>{{ t('settings.aboutLink') }}</h2>
+                <h2>{{ t('settings.update') }}</h2>
               </div>
               <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button v-if="updateInfo?.hasUpdate" type="button" class="button primary compact" @click="openGithub(updateInfo.downloadUrl)">
+                  <Download :size="14"/>{{ t('settings.downloadUpdate', { version: updateInfo.latestVersion }) }}
+                </button>
+                <button type="button" class="button secondary compact" :disabled="checkingUpdate" @click="checkUpdate(false)">
+                  <RefreshCw :size="14" :class="{ spin: checkingUpdate }"/>{{ checkingUpdate ? t('settings.checkingUpdate') : t('settings.checkUpdate') }}
+                </button>
+                <button type="button" class="button ghost compact" @click="openGithub()">
+                  {{ t('settings.githubRelease') }}<ArrowUpRight :size="14"/>
+                </button>
                 <button type="button" class="button ghost compact" @click="open('logs')">
                   <FileText :size="14"/>{{ t('settings.logs') }}
                 </button>
-                <button type="button" class="button secondary compact" @click="aboutOpen = true">
+                <button type="button" class="button ghost compact" @click="aboutOpen = true">
                   <HelpCircle :size="14"/>{{ t('settings.aboutLink') }}
                 </button>
               </div>
@@ -874,13 +917,26 @@ function open(kind: string, subpath?: string) {
     <div v-if="aboutOpen" class="modal-backdrop" @click.self="aboutOpen = false" @keydown.esc="aboutOpen = false">
       <section class="about-modal" role="dialog" aria-modal="true" aria-labelledby="about-title" tabindex="-1">
         <button class="icon-button modal-close" :aria-label="t('common.close')" autofocus @click="aboutOpen = false"><X :size="17"/></button>
-        <div style="display:flex;align-items:center;gap:14px">
-          <img src="/art/game/logo-bordered.png" alt="Flotsam" style="width:148px;height:auto"/>
-          <div>
-            <h2 id="about-title">{{ t('app.version') }}</h2>
-            <p style="font-size:12.5px;color:var(--muted)">
-              {{ store.data?.gameVersion ? `Flotsam ${store.data.gameVersion} · ` : '' }}{{ desktop ? t('app.desktop') : t('app.preview') }}
-            </p>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding-right:32px">
+          <div style="display:flex;align-items:center;gap:14px">
+            <img src="/art/game/logo-bordered.png" alt="Flotsam" style="width:148px;height:auto"/>
+            <div>
+              <h2 id="about-title">{{ t('app.version') }}</h2>
+              <p style="font-size:12.5px;color:var(--muted)">
+                {{ store.data?.gameVersion ? `Flotsam ${store.data.gameVersion} · ` : '' }}{{ desktop ? t('app.desktop') : t('app.preview') }}
+              </p>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button v-if="updateInfo?.hasUpdate" type="button" class="button primary compact" @click="openGithub(updateInfo.downloadUrl)">
+              <Download :size="14"/>{{ t('settings.downloadUpdate', { version: updateInfo.latestVersion }) }}
+            </button>
+            <button type="button" class="button secondary compact" :disabled="checkingUpdate" @click="checkUpdate(false)">
+              <RefreshCw :size="14" :class="{ spin: checkingUpdate }"/>{{ checkingUpdate ? t('settings.checkingUpdate') : t('settings.checkUpdate') }}
+            </button>
+            <button type="button" class="button ghost compact" @click="openGithub()">
+              {{ t('settings.githubRelease') }}<ArrowUpRight :size="14"/>
+            </button>
           </div>
         </div>
         <p style="font-size:13px;line-height:1.6">{{ t('credits.body') }} {{ t('credits.features') }}</p>

@@ -24,3 +24,4 @@ export type Page='home'|'mods'|'saves'|'online'|'settings';
 export type ModSection='local'|'online'|'profiles';
 /** One confirmation request at a time; the launcher never guesses an answer. */
 export interface ConfirmRequest {title:string;body:string;detail?:string;confirm:string;cancel?:string;danger?:boolean}
+export interface UpdateInfo {currentVersion:string;latestVersion:string;hasUpdate:boolean;releaseUrl:string;downloadUrl:string;notes:string;publishedAt:string}

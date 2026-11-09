@@ -51,7 +51,9 @@ export async function command<T>(name: string, args: Record<string, unknown> = {
     case 'nexus_account': return null as T;
     case 'compatibility_report': return { game: '', loader: false, plugins: [], patchers: [], fingerprint: '', warning: '' } as T;
     case 'room_status': return { connected: false, host: false, mode: '', address: '', invite: '', members: [], messages: [], error: '', differences: [], latency: 0 } as T;
-    case 'multiplayer_status': return { installed: false, version: '0.5.0', runtime: null } as T;
+    case 'multiplayer_status': return { installed: false, version: '0.0.1-pre', runtime: null } as T;
+    case 'check_launcher_update': return { currentVersion: '0.0.1-pre', latestVersion: '0.0.1-pre', hasUpdate: false, releaseUrl: 'https://github.com/senran-N/Flotsam-Launcher/releases', downloadUrl: 'https://github.com/senran-N/Flotsam-Launcher/releases', notes: '', publishedAt: '' } as T;
+    case 'open_github_url': return undefined as T;
     default: throw new Error('请在桌面版中使用此功能');
   }
 }

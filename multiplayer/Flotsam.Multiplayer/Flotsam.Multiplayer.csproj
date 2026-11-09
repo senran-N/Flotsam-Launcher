@@ -7,7 +7,7 @@
     <GameRoot Condition="'$(GameRoot)'==''">D:\Epic Games\Flotsam</GameRoot>
     <LoaderRoot>$(MSBuildThisFileDirectory)..\vendor\BepInEx-5.4.23.6\BepInEx\core</LoaderRoot>
     <AssemblyName>Flotsam.Multiplayer</AssemblyName>
-    <Version>0.5.0</Version>
+    <Version>0.0.1</Version>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>

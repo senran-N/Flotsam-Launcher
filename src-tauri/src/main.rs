@@ -79,7 +79,9 @@ fn main() {
             apply_mod_profile,
             delete_mod_profile,
             export_mod_profile,
-            import_mod_profile
+            import_mod_profile,
+            check_launcher_update,
+            open_github_url
         ])
         .run(tauri::generate_context!())
         .expect("启动器无法运行");

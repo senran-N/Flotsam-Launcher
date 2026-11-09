@@ -409,12 +409,12 @@ test('desktop shell locks to zero outer vertical scroll across all screens and k
     expect(metrics.scrollW).toBeLessThanOrEqual(metrics.innerW);
     expect(metrics.cardOverflow).toBe(false);
     await expect(page.getByText('1.0.1f9')).toHaveCount(0);
-    await expect(page.getByText('0.5.0')).toHaveCount(0);
+    await expect(page.getByText('0.0.1-pre')).toHaveCount(0);
   }
 
   // Versions and diagnostics live exclusively inside the About modal
   await page.locator('.about-icon-btn').click();
-  const about = page.getByRole('dialog', { name: /浮游 · 0\.5\.0/ });
+  const about = page.getByRole('dialog', { name: /浮游 · 0\.0\.1-pre/ });
   await expect(about).toBeVisible();
   await expect(about).toContainText('Flotsam 1.0.1f9');
   await expect(about).toContainText('本机组件');

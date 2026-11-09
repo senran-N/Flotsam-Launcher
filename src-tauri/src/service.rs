@@ -1106,6 +1106,180 @@ pub async fn open_mod_file(
     .map_err(err)?
 }
 
+pub const LAUNCHER_VERSION: &str = "0.0.1-pre";
+pub const GITHUB_REPO: &str = "senran-N/Flotsam-Launcher";
+pub const GITHUB_RELEASES_URL: &str = "https://github.com/senran-N/Flotsam-Launcher/releases";
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub latest_version: String,
+    pub has_update: bool,
+    pub release_url: String,
+    pub download_url: String,
+    pub notes: String,
+    pub published_at: String,
+}
+
+fn parse_semver_parts(raw: &str) -> ((u64, u64, u64), Option<String>) {
+    let trimmed = raw.trim().trim_start_matches(['v', 'V']);
+    let (core, pre) = match trimmed.split_once('-') {
+        Some((c, p)) => (c, Some(p.to_ascii_lowercase())),
+        None => (trimmed, None),
+    };
+    let mut nums = core
+        .split('.')
+        .map(|s| s.parse::<u64>().unwrap_or(0));
+    let major = nums.next().unwrap_or(0);
+    let minor = nums.next().unwrap_or(0);
+    let patch = nums.next().unwrap_or(0);
+    ((major, minor, patch), pre)
+}
+
+pub fn is_newer_version(current: &str, latest: &str) -> bool {
+    let c_clean = current.trim().trim_start_matches(['v', 'V']);
+    let l_clean = latest.trim().trim_start_matches(['v', 'V']);
+    if l_clean.is_empty() || c_clean.eq_ignore_ascii_case(l_clean) {
+        return false;
+    }
+    let (c_ver, c_pre) = parse_semver_parts(c_clean);
+    let (l_ver, l_pre) = parse_semver_parts(l_clean);
+    if l_ver != c_ver {
+        return l_ver > c_ver;
+    }
+    match (c_pre, l_pre) {
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (Some(cp), Some(lp)) => lp > cp,
+        (None, None) => false,
+    }
+}
+
+#[tauri::command]
+pub async fn check_launcher_update() -> Result<UpdateInfo> {
+    let api_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=10");
+    let client = reqwest::Client::builder()
+        .user_agent(format!("Flotsam-Launcher/{LAUNCHER_VERSION}"))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(err)?;
+
+    let response = client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("无法连接 GitHub 更新源：{e}"))?;
+
+    if response.status().as_u16() == 404 {
+        return Ok(UpdateInfo {
+            current_version: LAUNCHER_VERSION.into(),
+            latest_version: LAUNCHER_VERSION.into(),
+            has_update: false,
+            release_url: GITHUB_RELEASES_URL.into(),
+            download_url: GITHUB_RELEASES_URL.into(),
+            notes: String::new(),
+            published_at: String::new(),
+        });
+    }
+
+    if !response.status().is_success() {
+        return Err(format!("GitHub 返回状态异常 ({})", response.status()));
+    }
+
+    let releases: serde_json::Value = response.json().await.map_err(err)?;
+    let Some(list) = releases.as_array() else {
+        return Err("GitHub 发布列表格式无效".into());
+    };
+
+    let newest = list
+        .iter()
+        .find(|item| !item.get("draft").and_then(|v| v.as_bool()).unwrap_or(false));
+
+    let Some(rel) = newest else {
+        return Ok(UpdateInfo {
+            current_version: LAUNCHER_VERSION.into(),
+            latest_version: LAUNCHER_VERSION.into(),
+            has_update: false,
+            release_url: GITHUB_RELEASES_URL.into(),
+            download_url: GITHUB_RELEASES_URL.into(),
+            notes: String::new(),
+            published_at: String::new(),
+        });
+    };
+
+    let tag = rel
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(LAUNCHER_VERSION)
+        .trim_start_matches(['v', 'V'])
+        .to_string();
+    let html_url = rel
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(GITHUB_RELEASES_URL)
+        .to_string();
+    let notes = rel
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let published_at = rel
+        .get("published_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut download_url = html_url.clone();
+    if let Some(assets) = rel.get("assets").and_then(|v| v.as_array()) {
+        if let Some(asset) = assets.iter().find(|a| {
+            a.get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| {
+                    let lower = n.to_ascii_lowercase();
+                    lower.ends_with(".exe") || lower.ends_with(".zip")
+                })
+        }) {
+            if let Some(dl) = asset.get("browser_download_url").and_then(|u| u.as_str()) {
+                download_url = dl.to_string();
+            }
+        }
+    }
+
+    let has_update = is_newer_version(LAUNCHER_VERSION, &tag);
+    Ok(UpdateInfo {
+        current_version: LAUNCHER_VERSION.into(),
+        latest_version: tag,
+        has_update,
+        release_url: html_url,
+        download_url,
+        notes,
+        published_at,
+    })
+}
+
+#[tauri::command]
+pub fn open_github_url(url: Option<String>) -> Result<()> {
+    let target = url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| GITHUB_RELEASES_URL.to_string());
+    if !target.starts_with("https://github.com/senran-N/Flotsam-Launcher")
+        && !target.starts_with("https://objects.githubusercontent.com/")
+    {
+        return Err("仅允许打开官方 GitHub 发布链接".into());
+    }
+    #[cfg(windows)]
+    {
+        Command::new("explorer.exe")
+            .arg(&target)
+            .spawn()
+            .map_err(err)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,5 +1370,14 @@ mod tests {
         assert_eq!(slot.play_time_seconds, Some(5432));
         assert_eq!(slot.modified, 1794030898);
         assert_eq!(slot.game_version.as_deref(), Some("1.0.1f9"));
+    }
+    #[test]
+    fn compares_semver_and_prerelease_versions_accurately() {
+        assert!(!is_newer_version("0.0.1-pre", "0.0.1-pre"));
+        assert!(!is_newer_version("0.0.1-pre", "v0.0.1-pre"));
+        assert!(is_newer_version("0.0.1-pre", "0.0.1"));
+        assert!(is_newer_version("0.0.1-pre", "v0.0.2-pre"));
+        assert!(is_newer_version("0.0.1-pre", "0.1.0"));
+        assert!(!is_newer_version("0.0.1", "0.0.1-pre"));
     }
 }

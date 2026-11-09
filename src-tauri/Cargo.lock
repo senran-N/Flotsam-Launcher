@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "flotsam-launcher"
-version = "0.5.0"
+version = "0.0.1-pre"
 dependencies = [
  "dotnetdll",
  "flate2",
