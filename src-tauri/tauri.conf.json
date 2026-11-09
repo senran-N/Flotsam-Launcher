@@ -8,5 +8,10 @@
     "windows": [{"label":"main","title":"浮游 · Flotsam Launcher","width":1160,"height":740,"minWidth":900,"minHeight":620,"center":true,"decorations":false,"backgroundColor":"#1778AE"}],
     "security":{"csp":"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost"}
   },
-  "bundle": {"active":false}
+  "bundle": {
+    "active": false,
+    "publisher": "Flotsam Launcher Contributors",
+    "shortDescription": "Flotsam Community Desktop Launcher",
+    "icon": ["icons/icon.ico", "icons/icon.png"]
+  }
 }

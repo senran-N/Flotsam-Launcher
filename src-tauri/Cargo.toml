@@ -1,7 +1,9 @@
 [package]
 name = "flotsam-launcher"
 version = "0.5.0"
-description = "Independent Flotsam game and mod launcher"
+description = "Flotsam Community Desktop Launcher and Mod Manager"
+authors = ["Flotsam Launcher Contributors"]
+license = "MIT"
 edition = "2021"
 
 [features]
@@ -35,6 +37,5 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [profile.release]
-strip = true
-lto = "thin"
-codegen-units = 8
+strip = false
+codegen-units = 16
