@@ -8,17 +8,17 @@ mod online;
 mod packages;
 mod profiles;
 mod queue;
-mod service;
 mod save_restore;
+mod service;
+
+use compat::{compatibility_preflight, compatibility_report};
 use multiplayer::*;
 use network::*;
 use online::*;
 use profiles::*;
-use compat::{compatibility_report, compatibility_preflight};
 use queue::*;
-use service::*;
 use save_restore::{list_save_backups, restore_save_backup};
-use tauri::Manager;
+use service::*;
 
 fn main() {
     tauri::Builder::default()
@@ -26,20 +26,6 @@ fn main() {
         .manage(NetworkState::default())
         .manage(OnlineState::default())
         .manage(std::sync::Arc::new(queue::DownloadQueue::default()))
-        .setup(|app| {
-            if std::env::args().any(|arg| arg == "--diagnose") {
-                let result = get_snapshot_sync(app.handle().clone(), &app.state::<LauncherState>());
-                let report = match result {
-                    Ok(snapshot) => serde_json::to_string_pretty(&snapshot)?,
-                    Err(error) => {
-                        serde_json::to_string_pretty(&serde_json::json!({"error":error}))?
-                    }
-                };
-                std::fs::write("diagnostics.json", report)?;
-                app.handle().exit(0);
-            }
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             save_settings,
@@ -55,6 +41,7 @@ fn main() {
             list_save_backups,
             restore_save_backup,
             room_status,
+            network_interfaces,
             host_room,
             join_room,
             leave_room,

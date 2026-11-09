@@ -463,14 +463,203 @@ fn parse_invite(invite: &str) -> Result<(std::net::SocketAddr, String)> {
     }
     Ok((address, secret.into()))
 }
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetInterface {
+    pub name: String,
+    pub ip: String,
+    pub kind: String,
+}
+
+fn classify_interface(name: &str, desc: &str, ip: std::net::Ipv4Addr) -> Option<&'static str> {
+    if ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+    {
+        return None;
+    }
+    let octets = ip.octets();
+    // RFC 2544 benchmark range used by Clash / FlClash / Mihomo / Sing-box TUN adapters.
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return None;
+    }
+    let hay = format!("{} {}", name.to_lowercase(), desc.to_lowercase());
+    const IGNORED: &[&str] = &[
+        "clash",
+        "flclash",
+        "mihomo",
+        "sing-box",
+        "singbox",
+        "nekoray",
+        "nekobox",
+        "v2ray",
+        "xray",
+        "shadowrocket",
+        "proxifier",
+        "wsl",
+        "hyper-v",
+        "vethernet",
+        "docker",
+        "vmware",
+        "virtualbox",
+        "vboxnet",
+        "npcap",
+        "bluetooth",
+        "teredo",
+        "isatap",
+        "loopback",
+    ];
+    if IGNORED.iter().any(|kw| hay.contains(kw)) {
+        return None;
+    }
+    const VLAN_TOOLS: &[&str] = &[
+        "tailscale",
+        "zerotier",
+        "radmin",
+        "hamachi",
+        "easytier",
+        "wireguard",
+        "pgyvpn",
+        "oray",
+        "蒲公英",
+        "netbird",
+        "nebula",
+        "husarnet",
+        "tinc",
+        "openvpn",
+        "tap-windows",
+    ];
+    if VLAN_TOOLS.iter().any(|kw| hay.contains(kw)) {
+        return Some("vlan");
+    }
+    let is_physical = ["wlan", "wi-fi", "wireless", "ethernet", "以太网"]
+        .iter()
+        .any(|kw| hay.contains(kw));
+    if !is_physical && (octets[0] == 26 || octets[0] == 25) {
+        return Some("vlan");
+    }
+    Some("lan")
+}
+
+#[cfg(windows)]
+unsafe fn read_pwstr(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while len < 512 && *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+}
+
+pub fn detect_network_interfaces() -> Vec<NetInterface> {
+    let mut out: Vec<NetInterface> = Vec::new();
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::ERROR_SUCCESS,
+            NetworkManagement::{
+                IpHelper::{
+                    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+                    GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+                },
+                Ndis::IfOperStatusUp,
+            },
+            Networking::WinSock::{AF_INET, SOCKADDR_IN},
+        };
+        let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+        let mut buf_len: u32 = 32 * 1024;
+        let mut buf = vec![0u8; buf_len as usize];
+        // SAFETY: buffer is properly sized; if ERROR_BUFFER_OVERFLOW occurs we resize once.
+        unsafe {
+            let mut rc = GetAdaptersAddresses(
+                AF_INET as u32,
+                flags,
+                std::ptr::null(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut buf_len,
+            );
+            if rc != ERROR_SUCCESS && buf_len > buf.len() as u32 && buf_len <= 512 * 1024 {
+                buf.resize(buf_len as usize, 0);
+                rc = GetAdaptersAddresses(
+                    AF_INET as u32,
+                    flags,
+                    std::ptr::null(),
+                    buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                    &mut buf_len,
+                );
+            }
+            if rc == ERROR_SUCCESS {
+                let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+                while !cur.is_null() {
+                    let adapter = &*cur;
+                    if adapter.OperStatus == IfOperStatusUp
+                        && adapter.IfType != IF_TYPE_SOFTWARE_LOOPBACK
+                    {
+                        let friendly = read_pwstr(adapter.FriendlyName);
+                        let desc = read_pwstr(adapter.Description);
+                        let label = if friendly.trim().is_empty() {
+                            desc.trim().to_string()
+                        } else {
+                            friendly.trim().to_string()
+                        };
+                        let mut unicast = adapter.FirstUnicastAddress;
+                        while !unicast.is_null() {
+                            let ua = &*unicast;
+                            let sa = ua.Address.lpSockaddr;
+                            if !sa.is_null() && (*sa).sa_family == AF_INET {
+                                let sin = &*(sa as *const SOCKADDR_IN);
+                                let ipv4 =
+                                    std::net::Ipv4Addr::from(sin.sin_addr.S_un.S_addr.to_ne_bytes());
+                                if let Some(kind) = classify_interface(&label, &desc, ipv4) {
+                                    let ip_str = ipv4.to_string();
+                                    if !out.iter().any(|item| item.ip == ip_str) {
+                                        out.push(NetInterface {
+                                            name: label.clone(),
+                                            ip: ip_str,
+                                            kind: kind.into(),
+                                        });
+                                    }
+                                }
+                            }
+                            unicast = ua.Next;
+                        }
+                    }
+                    cur = adapter.Next;
+                }
+            }
+        }
+    }
+    out.sort_by_key(|item| if item.kind == "vlan" { 0 } else { 1 });
+    out
+}
+
+#[tauri::command]
+pub fn network_interfaces() -> Vec<NetInterface> {
+    detect_network_interfaces()
+}
+
 fn local_ip() -> String {
+    let detected = detect_network_interfaces();
+    if let Some(first) = detected.first() {
+        return first.ip.clone();
+    }
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| {
             s.connect("192.0.2.1:80")?;
             s.local_addr()
         })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".into())
+        .ok()
+        .and_then(|a| match a.ip() {
+            std::net::IpAddr::V4(v4) if classify_interface("", "", v4).is_some() => {
+                Some(v4.to_string())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| "127.0.0.1".into())
 }
 fn snapshot_wire(status: &RoomStatus) -> Wire {
     Wire::State {
@@ -1596,5 +1785,37 @@ mod tests {
         assert_eq!(disconnect_reason("无效的房间消息"), "protocol");
         assert_eq!(disconnect_reason("房主关闭了房间"), "host_closed");
         assert_eq!(disconnect_reason("connection reset"), "connection_lost");
+    }
+    #[test]
+    fn interface_classifier_excludes_proxy_tuns_and_wsl_while_detecting_vlan_and_lan() {
+        use std::net::Ipv4Addr;
+        assert_eq!(
+            classify_interface("FlClash", "Meta Tunnel", Ipv4Addr::new(198, 18, 0, 1)),
+            None
+        );
+        assert_eq!(
+            classify_interface(
+                "vEthernet (WSL (Hyper-V firewall))",
+                "Hyper-V Virtual Ethernet Adapter",
+                Ipv4Addr::new(192, 168, 32, 1)
+            ),
+            None
+        );
+        assert_eq!(
+            classify_interface("Tailscale", "Tailscale Tunnel", Ipv4Addr::new(100, 101, 20, 5)),
+            Some("vlan")
+        );
+        assert_eq!(
+            classify_interface("Radmin VPN", "Famatech Radmin VPN", Ipv4Addr::new(26, 44, 12, 8)),
+            Some("vlan")
+        );
+        assert_eq!(
+            classify_interface("WLAN", "Intel Wi-Fi 6E", Ipv4Addr::new(100, 81, 18, 41)),
+            Some("lan")
+        );
+        assert_eq!(
+            classify_interface("以太网", "Realtek PCIe GbE", Ipv4Addr::new(192, 168, 16, 2)),
+            Some("lan")
+        );
     }
 }

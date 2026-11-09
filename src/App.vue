@@ -6,10 +6,11 @@ import {
   RotateCcw, PackageCheck, ShieldAlert, FolderClock, Anchor, HelpCircle, Trash2, Power,
 } from 'lucide-vue-next';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useLauncher } from './store';
 import { command, desktop, errorText } from './bridge';
 import { t } from './i18n';
-import type { Language, ModEntry, ModPackage, Page, RemovedPackage, SaveEntry, Settings } from './types';
+import type { DisplayMode, DownloadTask, Language, ModEntry, ModPackage, Page, RemovedPackage, SaveEntry, Settings } from './types';
 import OnlineMods from './components/OnlineMods.vue';
 import RoomPanel from './components/RoomPanel.vue';
 import LocalMod from './components/LocalMod.vue';
@@ -37,6 +38,7 @@ const draft = ref<Settings>({
   backupBeforeLaunch: true,
   reducedMotion: false,
   language: 'zh',
+  displayMode: 'fullscreen',
 });
 
 const nav = computed(() => [
@@ -52,7 +54,6 @@ const titles = computed<Record<Page, string>>(() => ({
   saves: t('nav.saves'),
   online: t('nav.online'),
   settings: t('nav.settings'),
-  activity: t('nav.activity'),
 }));
 
 const filters = computed(() => [
@@ -88,7 +89,7 @@ const needsLoader = computed(() => Boolean(store.data?.installed) && !store.load
 const saveBackups = ref<InstanceType<typeof SaveBackupPanel> | null>(null);
 
 async function backupSaves() {
-  const backup = await store.run<string>('backup_saves', {}, '存档已备份');
+  const backup = await store.run<string>('backup_saves', {}, t('saves.backedUp'));
   if (backup) await saveBackups.value?.load();
 }
 
@@ -96,7 +97,7 @@ watch(
   () => store.data?.settings,
   (v) => {
     if (!v) return;
-    draft.value = { ...v };
+    draft.value = { ...v, displayMode: v.displayMode || 'fullscreen' };
     document.documentElement.dataset.reducedMotion = String(v.reducedMotion);
   },
   { immediate: true },
@@ -118,9 +119,20 @@ watch(aboutOpen, async (value) => {
 });
 
 let timer: ReturnType<typeof setInterval> | undefined;
+let unlistenQueue: UnlistenFn | undefined;
+let unmounted = false;
 onMounted(async () => {
   await store.refresh();
   await store.loadTasks();
+  if (desktop && !unmounted) {
+    try {
+      const off = await listen<DownloadTask[]>('download-queue', (event) => {
+        void store.queueChanged(event.payload);
+      });
+      if (unmounted) off();
+      else unlistenQueue = off;
+    } catch { /* non-tauri preview */ }
+  }
   timer = setInterval(() => {
     if (document.visibilityState !== 'visible' || store.busy) return;
     store.refresh();
@@ -128,6 +140,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  unmounted = true;
+  unlistenQueue?.();
   clearInterval(timer);
 });
 
@@ -215,10 +229,15 @@ async function setLanguage(value: Language) {
   await persistSettings({ ...draft.value, language: value });
 }
 
+async function setDisplayMode(value: DisplayMode) {
+  if (draft.value.displayMode === value) return;
+  await persistSettings({ ...draft.value, displayMode: value });
+}
+
 async function launch() {
   if (!desktop) { store.notify(t('common.browserLaunch'), 'error'); return; }
   if (!store.data?.installed) { await browse(); return; }
-  await store.run('launch_game', { mode: store.profile === '原版' ? 'vanilla' : 'modded' }, '启动请求已发送');
+  await store.run('launch_game', { mode: store.profile === '原版' ? 'vanilla' : 'modded' }, t('home.launchSent'));
 }
 
 async function installLoader() {
@@ -230,7 +249,10 @@ async function installLoader() {
 async function importMod() {
   if (!desktop) { store.notify(t('common.browserImport'), 'error'); return; }
   const name = await store.run<string | null>('import_mod');
-  if (name) store.notify(`已导入 ${name}`, 'success');
+  if (name) {
+    store.chooseProfile('本地模组');
+    store.notify(t('mods.imported', { name }), 'success');
+  }
 }
 
 async function changePackage(pkg: ModPackage | RemovedPackage, action: string) {
@@ -263,10 +285,12 @@ async function changePackage(pkg: ModPackage | RemovedPackage, action: string) {
   }
   if (action === 'enable') {
     await store.run('change_mod_package', { id: pkg.id, action: 'enable' }, t('package.enabled'));
+    store.chooseProfile('本地模组');
     return;
   }
   if (action === 'restore') {
     await store.run('change_mod_package', { id: pkg.id, action: 'restore' }, t('package.restored', { name }));
+    store.chooseProfile('本地模组');
     if (!removedPackages.value.length) removedDrawer.value = false;
     return;
   }
@@ -360,7 +384,7 @@ function open(kind: string, subpath?: string) {
         <!-- 1. HOME: Full-Stage Hero + 3-Card Deck (Zero Scroll) -->
         <div v-if="page === 'home'" class="home-stage">
           <section class="hero-card" :aria-label="t('home.launch')">
-            <img class="hero-backdrop" src="/art/game/hero-flotsam.webp" alt="浮游世界海上灯塔城镇" fetchpriority="high"/>
+            <img class="hero-backdrop" src="/art/game/hero-flotsam.webp" :alt="t('app.name')" fetchpriority="high"/>
             <div class="hero-gradient"></div>
 
             <div class="hero-dock">
@@ -635,6 +659,17 @@ function open(kind: string, subpath?: string) {
 
             <div class="setting-row">
               <div class="setting-info">
+                <h2>{{ t('settings.displayMode') }}</h2>
+              </div>
+              <div class="language-switch" role="group" :aria-label="t('settings.displayMode')">
+                <button type="button" :aria-pressed="draft.displayMode === 'fullscreen'" :class="{ selected: draft.displayMode === 'fullscreen' }" @click="setDisplayMode('fullscreen')">{{ t('settings.displayFullscreen') }}</button>
+                <button type="button" :aria-pressed="draft.displayMode === 'windowed'" :class="{ selected: draft.displayMode === 'windowed' }" @click="setDisplayMode('windowed')">{{ t('settings.displayWindowed') }}</button>
+                <button type="button" :aria-pressed="draft.displayMode === 'game'" :class="{ selected: draft.displayMode === 'game' }" @click="setDisplayMode('game')">{{ t('settings.displayGame') }}</button>
+              </div>
+            </div>
+
+            <div class="setting-row">
+              <div class="setting-info">
                 <h2><label for="auto-backup">{{ t('settings.autoBackup') }}</label></h2>
               </div>
               <button
@@ -784,7 +819,7 @@ function open(kind: string, subpath?: string) {
           <dt>{{ t('saves.lastSaved', { time: '' }).replace(/[：:]\s*$/, '') }}</dt>
           <dd>{{ dateTime(inspectedSave.modified) }}</dd>
           <template v-if="inspectedSave.day != null">
-            <dt>生存进度</dt>
+            <dt>{{ t('saves.progress') }}</dt>
             <dd>
               {{ t('saves.day', { day: inspectedSave.day }) }}
               <template v-if="inspectedSave.drifters != null"> · {{ t('saves.drifters', { count: inspectedSave.drifters }) }}</template>
@@ -792,10 +827,10 @@ function open(kind: string, subpath?: string) {
             </dd>
           </template>
           <template v-if="inspectedSave.gameVersion">
-            <dt>存档版本</dt>
+            <dt>{{ t('saves.version') }}</dt>
             <dd>Flotsam {{ inspectedSave.gameVersion }}</dd>
           </template>
-          <dt>体积明细</dt>
+          <dt>{{ t('saves.sizeDetail') }}</dt>
           <dd>{{ t('saves.filesCount', { count: inspectedSave.files }) }} · {{ bytes(inspectedSave.size) }}</dd>
         </dl>
 

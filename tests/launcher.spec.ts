@@ -11,7 +11,8 @@ async function shim(page: Page, handler: string) {
       const handle = (${handler});
       const value = await handle(name, args, calls);
       if (value !== undefined) return value;
-      if (name === 'list_mod_profiles' || name === 'download_tasks' || name === 'list_downloads' || name === 'last_join_differences' || name === 'list_save_backups') return [];
+      if (name === 'list_mod_profiles' || name === 'download_tasks' || name === 'list_downloads' || name === 'last_join_differences' || name === 'list_save_backups' || name === 'network_interfaces') return [];
+      if (name === 'clear_join_differences') return null;
       throw new Error('请在桌面版中使用此功能');
     } } });
   })();`);
@@ -19,7 +20,7 @@ async function shim(page: Page, handler: string) {
 const calls = (page: Page) =>
   page.evaluate(() => (window as unknown as { testCalls: { name: string; args: Record<string, unknown> }[] }).testCalls);
 const snapshot = (over: Record<string, unknown> = {}) => ({
-  settings: { gamePath: 'D:\\\\Epic Games\\\\Flotsam', backupBeforeLaunch: true, reducedMotion: false, language: 'zh' },
+  settings: { gamePath: 'D:\\\\Epic Games\\\\Flotsam', backupBeforeLaunch: true, reducedMotion: false, language: 'zh', displayMode: 'fullscreen' },
   installed: true, loaderInstalled: true, mods: [], saves: [], backups: 0,
   gameVersion: '1.0.1f9', gameRunning: false, removedPackages: [], packageRecovery: false, ...over,
 });
@@ -40,6 +41,9 @@ test('browser preview keeps native actions honest', async ({ page }) => {
 test('settings auto-save with non-blocking toast and switch between Chinese and English', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: '设置', exact: true }).click();
+  await expect(page.getByRole('button', { name: '无边框全屏', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await page.getByRole('button', { name: '窗口模式', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('设置已保存');
   const motion = page.getByRole('switch', { name: '减少动态效果' });
   await motion.click();
   await expect(page.getByRole('status')).toContainText('设置已保存');
@@ -47,6 +51,7 @@ test('settings auto-save with non-blocking toast and switch between Chinese and 
   await expect(page.getByRole('status')).toContainText('Settings saved');
   await page.reload();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Windowed', exact: true })).toHaveAttribute('aria-pressed', 'true');
   await expect(page.getByRole('switch', { name: 'Reduce motion' })).toHaveAttribute('aria-checked', 'true');
   await expect(page.locator('html')).toHaveAttribute('lang', 'en');
   await page.getByRole('button', { name: '中文', exact: true }).click();
@@ -383,7 +388,7 @@ test('desktop shell locks to zero outer vertical scroll across all screens and k
     if (name === 'compatibility_report') return { game: '1234567890abcdef1234', loader: true, plugins: ['Flotsam.Multiplayer.dll'], patchers: [], fingerprint: 'fedcba0987654321fedc', blockers: [], warning: '' };
     return undefined;
   }`);
-  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.setViewportSize({ width: 1160, height: 740 });
   await page.goto('/');
 
   for (const label of ['启航', '联机', '模组', '存档', '设置'] as const) {
@@ -430,4 +435,42 @@ test('mobile navigation and every page stay within the viewport', async ({ page 
     await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   }
+});
+
+test('multiplayer lobby provides networking tutorial drawer and one-click virtual LAN adapter picker', async ({ page }) => {
+  await shim(page, `async (name, args) => {
+    if (name === 'get_snapshot') return ${JSON.stringify(snapshot())};
+    if (name === 'multiplayer_status') return { installed: true, version: '0.5.0', runtime: null };
+    if (name === 'network_interfaces') return [
+      { name: 'Tailscale', ip: '100.101.20.5', kind: 'vlan' },
+      { name: '以太网', ip: '192.168.16.2', kind: 'lan' },
+    ];
+    if (name === 'room_status') return globalThis.hosted || { connected: false, host: false, mode: '', address: '', invite: '', members: [], messages: [], error: '', differences: [], latency: 0 };
+    if (name === 'host_room') {
+      globalThis.hosted = { connected: true, host: true, mode: args.mode, address: args.advertise + ':' + args.port, invite: 'flotsam://' + args.advertise + ':' + args.port + '/' + 'c'.repeat(64), members: [{ id: 0, name: String(args.name) }], messages: [], error: '', differences: [], latency: 0 };
+      return globalThis.hosted;
+    }
+    return undefined;
+  }`);
+  await page.goto('/');
+  await page.getByRole('button', { name: '联机', exact: true }).click();
+  await expect(page.getByText('邀请地址：Tailscale (100.101.20.5)')).toBeVisible();
+
+  await page.getByRole('button', { name: '联机教程', exact: true }).click();
+  const guide = page.getByRole('dialog', { name: '联机与异地组网教程' });
+  await expect(guide).toBeVisible();
+  await expect(guide).toContainText('Tailscale');
+  await expect(guide).toContainText('Radmin VPN');
+  await expect(guide).toContainText('TCP 27025');
+  await expect(guide).toContainText('TCP 27027');
+  await page.keyboard.press('Escape');
+
+  await page.getByRole('button', { name: '网络设置', exact: true }).click();
+  await page.getByRole('button', { name: /局域网.*以太网.*192\.168\.16\.2/ }).click();
+  await expect(page.getByLabel('邀请地址', { exact: true })).toHaveValue('192.168.16.2');
+  await page.keyboard.press('Escape');
+
+  await page.getByRole('button', { name: '创建房间', exact: true }).last().click();
+  const host = (await calls(page)).find((c) => c.name === 'host_room');
+  expect(host?.args).toMatchObject({ advertise: '192.168.16.2', port: 27025 });
 });

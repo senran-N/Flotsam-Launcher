@@ -46,9 +46,17 @@ public sealed class Plugin : BaseUnityPlugin
             Directory.CreateDirectory(Options.profile);
             ReportRoot = Path.GetDirectoryName(Path.GetFullPath(path))!;
             Instance = this;
+            ApplyDisplaySettings();
             _harmony = new Harmony("local.flotsam.multiplayer");
-            _harmony.Patch(AccessTools.PropertyGetter(typeof(Application), "persistentDataPath"),
-                prefix: new HarmonyMethod(typeof(Plugin), nameof(ProfilePath)));
+            var defaultDataPath = Path.GetFullPath(Application.persistentDataPath);
+            if (!string.Equals(
+                    Options.profile.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    defaultDataPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                _harmony.Patch(AccessTools.PropertyGetter(typeof(Application), "persistentDataPath"),
+                    prefix: new HarmonyMethod(typeof(Plugin), nameof(ProfilePath)));
+            }
 
             if (Options.mode == "independent") FleetRuntime.Install(_harmony);
             GamePatches.Install(_harmony);
@@ -61,6 +69,27 @@ public sealed class Plugin : BaseUnityPlugin
             Logger.LogError(e);
             enabled = false;
         }
+    }
+
+    private static void ApplyDisplaySettings()
+    {
+        try
+        {
+            var nativeW = Math.Max(1280, Display.main.systemWidth);
+            var nativeH = Math.Max(720, Display.main.systemHeight);
+            if (Options.windowed || Options.displayMode == "windowed")
+            {
+                var winW = Math.Max(1280, Math.Min(1600, nativeW * 4 / 5));
+                var winH = Math.Max(720, Math.Min(900, nativeH * 4 / 5));
+                Screen.SetResolution(Options.windowed ? 1280 : winW, Options.windowed ? 720 : winH, FullScreenMode.Windowed);
+            }
+            else if (Options.displayMode == "fullscreen")
+            {
+                if (Screen.fullScreenMode == FullScreenMode.Windowed || Screen.width < nativeW)
+                    Screen.SetResolution(nativeW, nativeH, FullScreenMode.FullScreenWindow);
+            }
+        }
+        catch { }
     }
 
     private static bool ProfilePath(ref string __result)

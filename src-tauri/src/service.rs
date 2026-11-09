@@ -29,9 +29,21 @@ pub struct Settings {
     pub reduced_motion: bool,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_display_mode")]
+    pub display_mode: String,
 }
 pub(crate) fn default_language() -> String {
     "zh".into()
+}
+pub(crate) fn default_display_mode() -> String {
+    "fullscreen".into()
+}
+pub(crate) fn normalize_display_mode(raw: &str) -> &'static str {
+    match raw.trim() {
+        "windowed" => "windowed",
+        "game" => "game",
+        _ => "fullscreen",
+    }
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -40,6 +52,7 @@ impl Default for Settings {
             backup_before_launch: true,
             reduced_motion: false,
             language: default_language(),
+            display_mode: default_display_mode(),
         }
     }
 }
@@ -117,15 +130,88 @@ pub(crate) fn game_root(settings: &Settings) -> Result<PathBuf> {
     }
     Ok(root)
 }
-pub(crate) fn saves_root() -> Result<PathBuf> {
+pub(crate) fn flotsam_data_root() -> Result<PathBuf> {
     Ok(
         PathBuf::from(std::env::var_os("USERPROFILE").ok_or("无法读取用户目录")?)
             .join("AppData")
             .join("LocalLow")
             .join("Pajama Llama Games")
-            .join("Flotsam")
-            .join("Saves"),
+            .join("Flotsam"),
     )
+}
+
+pub(crate) fn saves_root() -> Result<PathBuf> {
+    Ok(flotsam_data_root()?.join("Saves"))
+}
+
+#[cfg(windows)]
+fn native_screen_resolution() -> (u32, u32) {
+    use windows_sys::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
+    // SAFETY: zero-initialized POD struct with dmSize set before calling Win32 API.
+    unsafe {
+        let mut dm: DEVMODEW = std::mem::zeroed();
+        dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(std::ptr::null(), ENUM_CURRENT_SETTINGS, &mut dm) != 0
+            && dm.dmPelsWidth >= 1024
+            && dm.dmPelsHeight >= 600
+        {
+            return (dm.dmPelsWidth, dm.dmPelsHeight);
+        }
+    }
+    (1920, 1080)
+}
+
+pub(crate) fn apply_display_mode(mode: &str) -> Result<()> {
+    let normalized = normalize_display_mode(mode);
+    #[cfg(windows)]
+    {
+        use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+        let (native_w, native_h) = native_screen_resolution();
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok((key, _)) = hkcu.create_subkey("Software\\Pajama Llama Games\\Flotsam") {
+            const K_MODE: &str = "Screenmanager Fullscreen mode_h3630240806";
+            const K_NATIVE: &str = "Screenmanager Resolution Use Native_h1405027254";
+            const K_W: &str = "Screenmanager Resolution Width_h182942802";
+            const K_H: &str = "Screenmanager Resolution Height_h2627697771";
+            const K_WIN_W: &str = "Screenmanager Resolution Window Width_h2524650974";
+            const K_WIN_H: &str = "Screenmanager Resolution Window Height_h1684712807";
+            match normalized {
+                "fullscreen" => {
+                    let _ = key.set_value(K_MODE, &1u32);
+                    let _ = key.set_value(K_NATIVE, &1u32);
+                    let _ = key.set_value(K_W, &native_w);
+                    let _ = key.set_value(K_H, &native_h);
+                }
+                "windowed" => {
+                    let win_w = (native_w * 4 / 5).clamp(1280, 1600);
+                    let win_h = (native_h * 4 / 5).clamp(720, 960);
+                    let _ = key.set_value(K_MODE, &3u32);
+                    let _ = key.set_value(K_NATIVE, &0u32);
+                    let _ = key.set_value(K_W, &win_w);
+                    let _ = key.set_value(K_H, &win_h);
+                    let _ = key.set_value(K_WIN_W, &win_w);
+                    let _ = key.set_value(K_WIN_H, &win_h);
+                }
+                _ => {
+                    // Heal legacy 960x540 lab window if present; otherwise preserve in-game choice.
+                    let cur_mode: u32 = key.get_value(K_MODE).unwrap_or(1);
+                    let cur_w: u32 = key.get_value(K_W).unwrap_or(native_w);
+                    let cur_h: u32 = key.get_value(K_H).unwrap_or(native_h);
+                    if cur_mode == 3 && cur_w <= 1024 && cur_h <= 600 {
+                        let _ = key.set_value(K_MODE, &1u32);
+                        let _ = key.set_value(K_NATIVE, &1u32);
+                        let _ = key.set_value(K_W, &native_w);
+                        let _ = key.set_value(K_H, &native_h);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = normalized;
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_windows_path(raw: &str) -> Result<String> {
@@ -511,12 +597,13 @@ pub fn save_settings(
     app: tauri::AppHandle,
     state: tauri::State<LauncherState>,
     network: tauri::State<crate::network::NetworkState>,
-    settings: Settings,
+    mut settings: Settings,
 ) -> Result<()> {
     let _guard = state.mutation.lock().map_err(err)?;
     if load_settings(&app)?.game_path != settings.game_path {
         crate::network::require_disconnected(&network)?;
     }
+    settings.display_mode = normalize_display_mode(&settings.display_mode).into();
     game_root(&settings)?;
     let path = settings_path(&app)?;
     fs::create_dir_all(path.parent().ok_or("设置路径无效")?).map_err(err)?;
@@ -543,7 +630,7 @@ fn copy_snapshot(source: &Path, dest: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn create_backup(app: &tauri::AppHandle) -> Result<String> {
+pub(crate) fn create_backup(app: &tauri::AppHandle) -> Result<String> {
     let source = saves_root()?;
     let mut files = Vec::new();
     walk_files(&source, &mut files)?;
@@ -644,6 +731,7 @@ fn launch_game_sync(app: tauri::AppHandle, state: &LauncherState, mode: String) 
             create_backup(&app)?;
         }
     }
+    apply_display_mode(&settings.display_mode)?;
     // Preserve Epic's bootstrap path when present. No authentication arguments are manufactured.
     let exe = if root.join("EOSBootstrapper.exe").exists() {
         root.join("EOSBootstrapper.exe")

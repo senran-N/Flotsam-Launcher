@@ -88,6 +88,7 @@ async function apply(profile: ModProfile) {
   try {
     const result = await command<ApplyReport>('apply_mod_profile', { id: profile.id });
     await store.refresh();
+    store.chooseProfile(store.enabledMods > 0 ? '本地模组' : '原版');
     store.notify(report(profile.name, result), result.missing.length ? 'info' : 'success');
   } catch (e) {
     store.notify(errorText(e), 'error');

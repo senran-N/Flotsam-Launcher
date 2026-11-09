@@ -33,6 +33,7 @@ foreach ($instance in @('host', 'client')) {
         secret = $secret
         profile = $profile
         autoStart = ($instance -eq 'host')
+        windowed = $true
         mode = $Mode
         nickname = if ($instance -eq 'host') { '房主' } else { '同行者' }
     } | ConvertTo-Json | Set-Content -LiteralPath $cfgPath -Encoding utf8NoBOM

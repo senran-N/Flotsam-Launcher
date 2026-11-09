@@ -77,6 +77,8 @@ public sealed class NetConfig
     [DataMember] public bool autoStart;
     [DataMember] public string mode = "shared";
     [DataMember] public string nickname = "";
+    [DataMember] public string displayMode = "game";
+    [DataMember] public bool windowed;
     [DataMember] public Rules rules = new Rules();
 
     [OnDeserializing]
@@ -87,6 +89,8 @@ public sealed class NetConfig
         secret = "";
         mode = "shared";
         nickname = "";
+        displayMode = "game";
+        windowed = false;
         rules = new Rules();
     }
 }

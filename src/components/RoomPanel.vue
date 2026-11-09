@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
-  ArrowRight, Copy, LogOut, Send, Users, Anchor, LoaderCircle, Download,
+  ArrowRight, Copy, LogOut, Send, Users, Anchor, LoaderCircle, Download, BookOpen, Wifi,
   Play, ShieldAlert, ClipboardPaste, Dices, UserMinus, Megaphone, SlidersHorizontal, HelpCircle,
 } from 'lucide-vue-next';
 import { command, desktop, errorText } from '../bridge';
 import { useLauncher } from '../store';
 import { t } from '../i18n';
-import type { Difference, RoomRules } from '../types';
+import type { Difference, NetInterface, RoomRules } from '../types';
 import PopoverBox from './PopoverBox.vue';
 import SlideDrawer from './SlideDrawer.vue';
 
@@ -33,7 +33,8 @@ interface Multiplayer {
   runtime: null | { status: string; ready: boolean; replicaReady: boolean; connected: boolean };
 }
 
-const CAPTAIN_NAMES = ['漂流船长', '海鸥领航员', '灯塔守望者', '拾荒机械师', '远洋舵手', '潮汐船匠'];
+const CAPTAIN_NAMES_ZH = ['漂流船长', '海鸥领航员', '灯塔守望者', '拾荒机械师', '远洋舵手', '潮汐船匠'];
+const CAPTAIN_NAMES_EN = ['Drift Captain', 'Gull Navigator', 'Beacon Keeper', 'Scrap Wright', 'Tide Helmsman', 'Salvage Skipper'];
 
 const store = useLauncher();
 const room = ref<Room | null>(null);
@@ -52,16 +53,29 @@ const rules = ref<RoomRules>({ stealing: true, sabotage: true, trading: true, fr
 const multiplayer = ref<Multiplayer | null>(null);
 const gameBusy = ref(false);
 const failures = ref<Difference[]>([]);
+const adapters = ref<NetInterface[]>([]);
 
-// Contextual Overlays (Popovers & Drawers instead of page-stretching accordions)
+// Contextual Overlays (Popovers & Drawers — zero page-stretching accordions)
 const netPop = ref(false);
 const guidePop = ref(false);
 const diffDrawer = ref(false);
+const tutorialDrawer = ref(false);
 
 const installed = computed(() => multiplayer.value?.installed ?? false);
 const gameRunning = computed(() => store.running);
 const activeRules = computed(() => room.value?.rules || rules.value);
 const activeDiffs = computed(() => (room.value?.connected ? room.value.differences : failures.value));
+const syncPort = computed(() => Math.min(65535, Math.max(1024, Number(port.value) || 27025) + 2));
+
+const selectedAdapterLabel = computed(() => {
+  const custom = advertise.value.trim();
+  if (!custom) {
+    const first = adapters.value[0];
+    return first ? `${first.name} (${first.ip})` : t('online.autoAdapter');
+  }
+  const hit = adapters.value.find((item) => item.ip === custom);
+  return hit ? `${hit.name} (${hit.ip})` : custom;
+});
 
 watch(() => store.onlineRole, (v) => { role.value = v; });
 watch(() => store.onlineMode, (v) => { mode.value = v; });
@@ -69,9 +83,29 @@ watch(() => store.onlineMode, (v) => { mode.value = v; });
 let timer: ReturnType<typeof setTimeout> | undefined;
 let disposed = false;
 
+function defaultNickname() {
+  return store.locale === 'en' ? 'Drift Captain' : '漂流船长';
+}
+
 function randomNickname() {
-  const pool = CAPTAIN_NAMES.filter((item) => item !== name.value);
-  name.value = pool[Math.floor(Math.random() * pool.length)] || '漂流船长';
+  const source = store.locale === 'en' ? CAPTAIN_NAMES_EN : CAPTAIN_NAMES_ZH;
+  const pool = source.filter((item) => item !== name.value);
+  name.value = pool[Math.floor(Math.random() * pool.length)] || defaultNickname();
+}
+
+async function loadAdapters() {
+  try {
+    adapters.value = await command<NetInterface[]>('network_interfaces');
+  } catch { /* ignore in degraded environments */ }
+}
+
+async function toggleNetPop() {
+  netPop.value = !netPop.value;
+  if (netPop.value) void loadAdapters();
+}
+
+function pickAdapter(ip: string) {
+  advertise.value = ip;
 }
 
 async function pasteInvite() {
@@ -157,11 +191,12 @@ async function launch() {
 
 async function connect() {
   if (busy.value) return;
-  const chosenName = name.value.trim() || '漂流船长';
+  const chosenName = name.value.trim() || defaultNickname();
   name.value = chosenName;
   busy.value = true;
   error.value = '';
   failures.value = [];
+  await command('clear_join_differences').catch(() => undefined);
   try {
     room.value = await command<Room>(
       role.value === 'host' ? 'host_room' : 'join_room',
@@ -172,7 +207,7 @@ async function connect() {
     localStorage.setItem('flotsam-nickname', chosenName);
     multiplayer.value = await command<Multiplayer>('multiplayer_status').catch(() => multiplayer.value);
     await store.refresh();
-    store.notify(role.value === 'host' ? '房间已创建' : '已连接房间', 'success');
+    store.notify(role.value === 'host' ? t('online.roomCreated') : t('online.roomJoined'), 'success');
   } catch (e) {
     error.value = errorText(e);
     failures.value = await command<Difference[]>('last_join_differences').catch(() => []);
@@ -185,6 +220,7 @@ async function connect() {
 async function leave() {
   try {
     await command('leave_room');
+    await command('clear_join_differences').catch(() => undefined);
     room.value = null;
     error.value = '';
     failures.value = [];
@@ -207,7 +243,7 @@ async function saveNotice() {
   if (!room.value?.host) return;
   try {
     await command('room_notice', { text: noticeDraft.value });
-    store.notify('公告已发布', 'success');
+    store.notify(t('online.noticeSaved'), 'success');
   } catch (e) {
     store.notify(errorText(e), 'error');
   }
@@ -229,6 +265,8 @@ async function copy() {
 
 function fixAction(difference: Difference) {
   diffDrawer.value = false;
+  void command('clear_join_differences').catch(() => undefined);
+  failures.value = [];
   if (difference.action === 'install_loader' || (difference.kind === 'loader' && !difference.action)) {
     void installLoader();
     return;
@@ -243,7 +281,10 @@ function fixLabel(difference: Difference) {
   return t('online.fixOpenMods');
 }
 
-onMounted(refresh);
+onMounted(() => {
+  void loadAdapters();
+  void refresh();
+});
 onUnmounted(() => { disposed = true; clearTimeout(timer); });
 </script>
 
@@ -251,9 +292,14 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
   <div class="room-stage">
     <div v-if="error || room?.error" class="inline-error" role="alert">
       <span>{{ error || room?.error }}</span>
-      <button v-if="activeDiffs.length" type="button" class="text-button" @click="diffDrawer = true">
-        {{ t('online.differences') }} ({{ activeDiffs.length }})
-      </button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button v-if="activeDiffs.length" type="button" class="text-button" @click="diffDrawer = true">
+          {{ t('online.differences') }} ({{ activeDiffs.length }})
+        </button>
+        <button type="button" class="text-button" @click="tutorialDrawer = true">
+          <BookOpen :size="13"/>{{ t('online.tutorialBtn') }}
+        </button>
+      </div>
     </div>
 
     <!-- CONNECTED ROOM: Fixed 2-Row Split (Zero Outer Scroll) -->
@@ -276,20 +322,29 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
             <Copy :size="14"/>{{ t('online.copy') }}
           </button>
 
+          <button type="button" class="button ghost compact" @click="tutorialDrawer = true">
+            <BookOpen :size="14"/>{{ t('online.tutorialBtn') }}
+          </button>
+
           <button v-if="room.differences.length" type="button" class="button secondary compact" @click="diffDrawer = true">
             <ShieldAlert :size="15"/>{{ t('online.differences') }} ({{ room.differences.length }})
           </button>
 
-          <!-- Anchored Popover for Rules & In-Game Fleet Controls -->
-          <PopoverBox v-if="room.mode === 'independent'" :open="guidePop" width="330px" @close="guidePop = false">
+          <!-- Anchored Popover for Rules & In-Game Controls (Both Independent & Shared!) -->
+          <PopoverBox :open="guidePop" width="330px" @close="guidePop = false">
             <template #trigger>
-              <button type="button" class="icon-button" :aria-label="t('online.fleetGuideTitle')" @click="guidePop = !guidePop">
+              <button
+                type="button"
+                class="icon-button"
+                :aria-label="room.mode === 'independent' ? t('online.fleetGuideTitle') : t('online.sharedGuideTitle')"
+                @click="guidePop = !guidePop"
+              >
                 <HelpCircle :size="18"/>
               </button>
             </template>
-            <strong class="pop-title">{{ t('online.fleetGuideTitle') }}</strong>
-            <p class="pop-copy">{{ t('online.fleetGuideBody') }}</p>
-            <div class="pop-rules">
+            <strong class="pop-title">{{ room.mode === 'independent' ? t('online.fleetGuideTitle') : t('online.sharedGuideTitle') }}</strong>
+            <p class="pop-copy">{{ room.mode === 'independent' ? t('online.fleetGuideBody') : t('online.sharedGuideBody') }}</p>
+            <div v-if="room.mode === 'independent'" class="pop-rules">
               <span :class="['rule-chip', { on: activeRules.trading }]">{{ t('online.ruleTrading') }}</span>
               <span :class="['rule-chip', { on: activeRules.stealing }]">{{ t('online.ruleStealing') }}</span>
               <span :class="['rule-chip', { on: activeRules.sabotage }]">{{ t('online.ruleSabotage') }}</span>
@@ -336,6 +391,7 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
           <form v-if="room.host" class="notice-form" @submit.prevent="saveNotice">
             <Megaphone :size="15"/>
             <input v-model="noticeDraft" maxlength="200" :placeholder="t('online.noticePlaceholder')"/>
+            <button type="submit" class="text-button notice-submit">{{ t('online.publishNotice') }}</button>
           </form>
           <p v-else-if="room.notice" class="notice-banner"><Megaphone :size="14"/> {{ room.notice }}</p>
         </section>
@@ -374,19 +430,53 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
             {{ t('online.install') }}
           </button>
 
-          <!-- Network & Port Popover instead of layout-pushing <details> -->
-          <PopoverBox v-if="role === 'host'" :open="netPop" width="320px" @close="netPop = false">
+          <button type="button" class="button secondary compact" @click="tutorialDrawer = true">
+            <BookOpen :size="14"/>{{ t('online.tutorialBtn') }}
+          </button>
+
+          <!-- Network & 1-Click Adapter Picker Popover -->
+          <PopoverBox v-if="role === 'host'" :open="netPop" width="356px" @close="netPop = false">
             <template #trigger>
-              <button type="button" class="button ghost compact" @click="netPop = !netPop">
+              <button type="button" class="button ghost compact" @click="toggleNetPop">
                 <SlidersHorizontal :size="14"/>{{ t('online.network') }}
               </button>
             </template>
             <strong class="pop-title">{{ t('online.network') }}</strong>
+
+            <div v-if="adapters.length" class="adapter-section">
+              <span class="pop-label">{{ t('online.detectedAdapters') }}</span>
+              <div class="adapter-chips">
+                <button
+                  type="button"
+                  :class="['adapter-chip', { active: !advertise.trim() }]"
+                  @click="pickAdapter('')"
+                >
+                  <span>{{ t('online.autoAdapter') }}</span>
+                </button>
+                <button
+                  v-for="item in adapters"
+                  :key="item.ip"
+                  type="button"
+                  :class="['adapter-chip', item.kind, { active: advertise.trim() === item.ip }]"
+                  @click="pickAdapter(item.ip)"
+                >
+                  <span class="adapter-kind">{{ item.kind === 'vlan' ? t('online.adapterVlan') : t('online.adapterLan') }}</span>
+                  <strong>{{ item.name }}</strong>
+                  <code>{{ item.ip }}</code>
+                </button>
+              </div>
+            </div>
+
             <label class="pop-label" for="room-ip">{{ t('online.address') }}</label>
             <input id="room-ip" v-model="advertise" class="room-input" :placeholder="t('online.addressPlaceholder')"/>
             <label class="pop-label" for="room-port">{{ t('online.port') }}</label>
             <input id="room-port" v-model.number="port" class="room-input" type="number" min="1024" max="65533" required/>
-            <p class="pop-hint">{{ t('online.networkHelpBody') }}</p>
+            <div class="pop-foot-row">
+              <span class="pop-hint">TCP {{ port || 27025 }} / {{ syncPort }}</span>
+              <button type="button" class="text-button" @click="netPop = false; tutorialDrawer = true">
+                <BookOpen :size="13"/>{{ t('online.tutorialBtn') }}
+              </button>
+            </div>
           </PopoverBox>
         </div>
       </div>
@@ -454,7 +544,12 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
 
       <div class="lobby-footer">
         <span v-if="!desktop" class="preview-hint">{{ t('online.desktopOnly') }}</span>
+        <button v-else-if="role === 'host'" type="button" class="ip-status-pill" @click="toggleNetPop">
+          <Wifi :size="13"/>
+          <span>{{ t('online.usingIp', { label: selectedAdapterLabel }) }}</span>
+        </button>
         <span v-else class="preview-hint">{{ t('home.fleetDesc') }}</span>
+
         <button class="button primary connect-btn" :disabled="busy || !desktop || (role === 'join' && !invite.trim())">
           <LoaderCircle v-if="busy" class="spin" :size="17"/>
           <ArrowRight v-else :size="17"/>
@@ -463,7 +558,38 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
       </div>
     </form>
 
-    <!-- Slide-Over Drawer for Compatibility Differences -->
+    <!-- Slide-Over Drawer 1: Multiplayer & Virtual-LAN Connection Tutorial -->
+    <SlideDrawer :open="tutorialDrawer" :title="t('online.tutorialTitle')" width="450px" @close="tutorialDrawer = false">
+      <section class="tut-card">
+        <h3>{{ t('online.tutLanTitle') }}</h3>
+        <p>{{ t('online.tutLanBody') }}</p>
+      </section>
+
+      <section class="tut-card recommended">
+        <h3>{{ t('online.tutVlanTitle') }}</h3>
+        <ol class="tut-steps">
+          <li>{{ t('online.tutVlanStep1') }}</li>
+          <li>{{ t('online.tutVlanStep2') }}</li>
+          <li>{{ t('online.tutVlanStep3') }}</li>
+        </ol>
+      </section>
+
+      <section class="tut-card">
+        <h3>{{ t('online.tutPortTitle') }}</h3>
+        <p>{{ t('online.tutPortBody') }}</p>
+        <div class="port-badges">
+          <code>TCP {{ port || 27025 }}</code>
+          <code>TCP {{ syncPort }}</code>
+        </div>
+      </section>
+
+      <section class="tut-card">
+        <h3>{{ t('online.tutPlayTitle') }}</h3>
+        <p>{{ t('online.tutPlayBody') }}</p>
+      </section>
+    </SlideDrawer>
+
+    <!-- Slide-Over Drawer 2: Compatibility Differences -->
     <SlideDrawer :open="diffDrawer" :title="room?.connected ? t('online.differences') : t('online.lastJoinFail')" @close="diffDrawer = false">
       <div v-for="item in activeDiffs" :key="`${item.kind}:${item.detail}`" class="diff-card">
         <strong>{{ item.detail }}</strong>
@@ -485,7 +611,7 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
   gap: 12px;
 }
 
-/* Lobby Card (Fits comfortably inside 640px+ viewport with ZERO scroll) */
+/* Lobby Card (Fits comfortably inside 620px+ viewport with ZERO scroll) */
 .lobby-card {
   width: 100%;
   max-width: 780px;
@@ -514,6 +640,7 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .lobby-row {
@@ -618,10 +745,154 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
   color: var(--muted);
 }
 
+.ip-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1.5px dashed var(--outline);
+  background: var(--paper-bright);
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.ip-status-pill:hover {
+  background: #fff0c2;
+}
+
 .connect-btn {
   min-width: 168px;
   font-size: 15px;
   margin-left: auto;
+}
+
+/* Adapter Picker inside Network Popover */
+.adapter-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.adapter-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.adapter-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1.5px solid var(--line);
+  background: var(--paper-bright);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.adapter-chip:hover {
+  border-color: var(--outline);
+}
+
+.adapter-chip.active {
+  border-color: var(--outline);
+  background: #fff0c2;
+  font-weight: 800;
+}
+
+.adapter-kind {
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 800;
+  background: var(--raised);
+  border: 1px solid var(--outline);
+  flex: none;
+}
+
+.adapter-chip.vlan .adapter-kind {
+  background: #dff8ec;
+}
+
+.adapter-chip strong {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.adapter-chip code {
+  font-family: Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--ink-soft);
+}
+
+.pop-foot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* Tutorial Drawer Cards */
+.tut-card {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--paper-bright);
+  border: 2px solid var(--outline);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tut-card.recommended {
+  background: #fff7dc;
+  box-shadow: 0 3px 0 var(--outline);
+}
+
+.tut-card h3 {
+  font-size: 13.5px;
+  font-weight: 800;
+}
+
+.tut-card p,
+.tut-steps {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  line-height: 1.58;
+}
+
+.tut-steps {
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.port-badges {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.port-badges code {
+  padding: 2px 8px;
+  border-radius: 7px;
+  background: var(--raised);
+  border: 1.5px solid var(--outline);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 /* Connected Room Split */
@@ -811,7 +1082,7 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 7px 10px;
+  padding: 6px 10px;
   border-radius: 9px;
   background: rgba(246, 185, 59, 0.22);
   border: 1.5px solid var(--outline);
@@ -825,6 +1096,11 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
   border: 0;
   background: transparent;
   outline: none;
+}
+
+.notice-submit {
+  font-size: 11.5px;
+  padding: 2px 6px;
 }
 
 .empty-chat {

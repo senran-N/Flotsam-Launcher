@@ -1006,7 +1006,7 @@ h2 {
   width: 100%;
   max-width: 720px;
   margin: auto;
-  padding: 20px 24px;
+  padding: 18px 24px;
   background-color: var(--surface);
   background-image: url('/art/game/paper-map.webp');
   background-size: 520px;
@@ -1015,7 +1015,7 @@ h2 {
   box-shadow: var(--shadow-hard);
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
 }
 
 .setting-row {
@@ -1023,7 +1023,7 @@ h2 {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding-bottom: 14px;
+  padding-bottom: 11px;
   border-bottom: 1.5px dashed var(--line);
 }
 

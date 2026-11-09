@@ -24,6 +24,16 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 dotnetdll = "=0.3.1"
 
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+] }
+
 [profile.release]
 strip = true
 lto = "thin"

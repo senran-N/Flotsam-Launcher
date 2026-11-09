@@ -28,11 +28,13 @@ async function toggle() {
     emit('package', managed, packageEnabled.value ? 'disable' : 'enable');
     return;
   }
-  await store.run(
+  const enabling = !props.mod.enabled;
+  const ok = await store.run(
     'toggle_mod',
-    { file: props.mod.file, enabled: !props.mod.enabled },
-    props.mod.enabled ? '模组已停用' : '模组已启用',
+    { file: props.mod.file, enabled: enabling },
+    enabling ? t('mods.toggledOn') : t('mods.toggledOff'),
   );
+  if (ok !== undefined && enabling) store.chooseProfile('本地模组');
 }
 </script>
 

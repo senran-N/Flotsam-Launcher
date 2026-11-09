@@ -239,7 +239,8 @@ fn launch_multiplayer_sync(
 ) -> Result<()> {
     let _guard = state.mutation.lock().map_err(err)?;
     require_stopped(state)?;
-    let root = game_root(&load_settings(&app)?)?;
+    let settings = load_settings(&app)?;
+    let root = game_root(&settings)?;
     let directory_lock = crate::packages::lock(&root)?;
     require_stopped(state)?;
     crate::packages::recover(&root)?;
@@ -263,19 +264,37 @@ fn launch_multiplayer_sync(
         &mut *state.metadata.lock().map_err(err)?,
     )?)?;
     let connection = crate::network::game_connection(network)?;
+    if connection.host && settings.backup_before_launch {
+        let _backup_lock = crate::packages::lock_path(&app_root(&app)?.join("save-backup.lock"))?;
+        let mut files = Vec::new();
+        crate::service::walk_files(&crate::service::saves_root()?, &mut files)?;
+        if !files.is_empty() {
+            crate::service::create_backup(&app)?;
+        }
+    }
+    crate::service::apply_display_mode(&settings.display_mode)?;
     let base = app_root(&app)?.join("multiplayer");
     let session = base.join("session");
-    let profile = base.join(if connection.host {
-        "host-profile"
+    let real_data_root = crate::service::flotsam_data_root()?;
+    let profile = if connection.host {
+        real_data_root.clone()
     } else {
-        "client-profile"
-    });
+        base.join("client-profile")
+    };
     fs::create_dir_all(&session).map_err(err)?;
     fs::create_dir_all(&profile).map_err(err)?;
+    if !connection.host {
+        let src_prefs = real_data_root.join("PlayerSettings.json");
+        let dst_prefs = profile.join("PlayerSettings.json");
+        if src_prefs.is_file() && !dst_prefs.exists() {
+            let _ = fs::copy(&src_prefs, &dst_prefs);
+        }
+    }
     let stop = session.join("stop");
     if stop.exists() {
         fs::remove_file(stop).map_err(err)?;
     }
+    let display_mode = crate::service::normalize_display_mode(&settings.display_mode);
     let config = session.join("network.json");
     fs::write(
         &config,
@@ -287,6 +306,7 @@ fn launch_multiplayer_sync(
             "profile": profile.to_string_lossy(),
             "mode": connection.mode,
             "nickname": connection.nickname,
+            "displayMode": display_mode,
             "rules": {
                 "stealing": connection.rules.stealing,
                 "sabotage": connection.rules.sabotage,

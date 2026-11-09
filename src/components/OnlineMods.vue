@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { ArrowUpRight, Download, RefreshCw, Plug, LoaderCircle, PackagePlus, Search } from 'lucide-vue-next';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { ArrowUpRight, Download, RefreshCw, Plug, LoaderCircle, PackagePlus, Search, Trash2 } from 'lucide-vue-next';
 import { command, desktop, errorText } from '../bridge';
 import { useLauncher } from '../store';
 import { t } from '../i18n';
@@ -44,7 +43,6 @@ const packages = computed<ModPackage[]>(() => {
 });
 const gameRunning = computed(() => store.running);
 
-let unlisten: UnlistenFn | undefined;
 let disposed = false;
 
 async function load() {
@@ -69,7 +67,7 @@ async function connect() {
     account.value = await command<Account>('connect_nexus', { apiKey: key.value });
     key.value = '';
     accountOpen.value = false;
-    store.notify('已连接 Nexus 账号', 'success');
+    store.notify(t('discover.connected'), 'success');
     await load();
   } catch (e) {
     store.notify(errorText(e), 'error');
@@ -148,10 +146,10 @@ async function queueLink() {
     const url = new URL(nxm.value.trim());
     const match = url.pathname.match(/^\/mods\/(\d+)\/files\/(\d+)$/);
     if (url.protocol !== 'nxm:' || url.hostname !== 'flotsam' || Number(match?.[1]) !== selected.value?.id) {
-      throw new Error('请粘贴当前模组的下载管理器链接');
+      throw new Error(t('discover.nxmMismatch'));
     }
     const file = files.value.find((f) => f.id === Number(match?.[2]));
-    if (!file) throw new Error('链接文件不在列表中，请刷新');
+    if (!file) throw new Error(t('discover.nxmMissingFile'));
     await queueMod(file, nxm.value.trim());
   } catch (e) {
     store.notify(e instanceof Error ? e.message : errorText(e), 'error');
@@ -169,7 +167,8 @@ async function install(item: DownloadRecord) {
   try {
     await command<number>('install_download', { id: item.id, ...(packageId ? { packageId } : {}) });
     await store.refresh();
-    store.notify(`已安装 ${item.name}`, 'success');
+    store.chooseProfile('本地模组');
+    store.notify(t('discover.installed', { name: item.name }), 'success');
     downloads.value = await command<DownloadRecord[]>('list_downloads');
   } catch (e) {
     store.notify(errorText(e), 'error');
@@ -178,29 +177,32 @@ async function install(item: DownloadRecord) {
   }
 }
 
+async function discardCache(item: DownloadRecord) {
+  if (installing.value) return;
+  try {
+    await command('discard_download_cache', { id: item.id });
+    downloads.value = await command<DownloadRecord[]>('list_downloads');
+    store.notify(t('discover.discarded'), 'info');
+  } catch (e) {
+    store.notify(errorText(e), 'error');
+  }
+}
+
 function size(n: number) {
   return n ? `${(n / 1048576).toFixed(1)} MB` : '';
 }
 
-async function onTasks(next: DownloadTask[]) {
-  await store.queueChanged(next);
-  if (next.some((task) => task.state === 'done')) {
-    downloads.value = await command<DownloadRecord[]>('list_downloads').catch(() => downloads.value);
-  }
-}
+watch(
+  () => store.tasks.filter((task) => task.state === 'done').length,
+  async (doneCount, prevCount) => {
+    if (doneCount > (prevCount ?? 0) && !disposed) {
+      downloads.value = await command<DownloadRecord[]>('list_downloads').catch(() => downloads.value);
+    }
+  },
+);
 
-onMounted(async () => {
-  await load();
-  if (desktop && !disposed) {
-    try {
-      const off = await listen<DownloadTask[]>('download-queue', (event) => { void onTasks(event.payload); });
-      if (disposed) off();
-      else unlisten = off;
-    } catch { /* fallback polling */ }
-  }
-});
-
-onUnmounted(() => { disposed = true; unlisten?.(); key.value = ''; });
+onMounted(load);
+onUnmounted(() => { disposed = true; key.value = ''; });
 </script>
 
 <template>
@@ -325,11 +327,24 @@ onUnmounted(() => { disposed = true; unlisten?.(); key.value = ''; });
             <option value="">{{ t('discover.installAsNew') }}</option>
             <option v-for="pkg in packages" :key="pkg.id" :value="pkg.id">{{ t('discover.installAsUpdate', { name: pkg.name }) }}</option>
           </select>
-          <button type="button" class="button primary compact" :disabled="!!installing || gameRunning" @click="install(item)">
-            <LoaderCircle v-if="installing === item.id" :size="14" class="spin"/>
-            <PackagePlus v-else :size="14"/>
-            {{ installing === item.id ? t('discover.installing') : t('discover.install') }}
-          </button>
+          <div style="display:flex;align-items:center;gap:6px">
+            <button type="button" class="button primary compact" :disabled="!!installing || gameRunning" @click="install(item)">
+              <LoaderCircle v-if="installing === item.id" :size="14" class="spin"/>
+              <PackagePlus v-else :size="14"/>
+              {{ installing === item.id ? t('discover.installing') : t('discover.install') }}
+            </button>
+            <button
+              type="button"
+              class="icon-button"
+              style="width:32px;height:32px"
+              :aria-label="`${t('discover.discardCache')} ${item.name}`"
+              :title="t('discover.discardCache')"
+              :disabled="!!installing"
+              @click="discardCache(item)"
+            >
+              <Trash2 :size="14"/>
+            </button>
+          </div>
         </div>
       </section>
     </SlideDrawer>
