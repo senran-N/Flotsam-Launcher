@@ -57,6 +57,9 @@ internal static class FleetPhysicalActors
     private static GameObject? _practiceTargetShip;
     private static Material? _litMat;
     private static Material? _emissiveMat;
+    private static float _shakeRemaining;
+    private static float _shakeIntensity;
+    private static readonly Dictionary<string, AudioClip> CachedSfx = new Dictionary<string, AudioClip>(StringComparer.Ordinal);
 
     internal static FleetActionState[] CaptureRecentActions()
     {
@@ -118,7 +121,7 @@ internal static class FleetPhysicalActors
             _practiceTargetShip.transform.position = targetPos;
             AttachGenuineBoatMesh(_practiceTargetShip.transform, 1.35f);
             AttachCargoCrates(_practiceTargetShip.transform, true);
-            AttachWorldBanner(_practiceTargetShip.transform, "🎯 海上演练靶船", new Color(0.96f, 0.73f, 0.23f));
+            AttachWorldBanner(_practiceTargetShip.transform, "海上演练靶船", new Color(0.96f, 0.73f, 0.23f));
             SpawnNativeSplash(targetPos);
         }
         else
@@ -152,11 +155,12 @@ internal static class FleetPhysicalActors
 
         var isRaid = kind == "shipSteal";
         var bannerColor = isRaid ? new Color(0.94f, 0.42f, 0.24f) : new Color(0.96f, 0.73f, 0.23f);
-        var bannerTitle = isRaid ? "🏴‍☠️ 登船掠夺艇" : $"📦 运输船 · {label}";
+        var bannerTitle = isRaid ? "登船掠夺艇" : $"运输船 · {label}";
         AttachWorldBanner(root.transform, bannerTitle, bannerColor);
 
         SpawnNativeSplash(launchPos);
         SpawnNativePopup(launchPos + Vector3.up * 2.2f, bannerTitle);
+        PlayFleetSound(isRaid ? "raid_depart" : "boat_depart", launchPos, 0.72f);
 
         Voyages.Add(new ActiveVoyage
         {
@@ -181,7 +185,7 @@ internal static class FleetPhysicalActors
         var duration = Mathf.Clamp(dist / 36f, 0.65f, 1.75f);
         var arc = Mathf.Clamp(dist * 0.26f, 7.5f, 22f);
 
-        SpawnNativePopup(start + Vector3.up * 3.5f, "💣 船首火炮齐射！");
+        SpawnNativePopup(start + Vector3.up * 3.5f, "船首火炮齐射");
 
         for (var i = 0; i < 3; i++)
         {
@@ -257,16 +261,18 @@ internal static class FleetPhysicalActors
                     v.Phase = 1;
                     v.BoardTimer = v.Kind == "shipSteal" ? 1.8f : 0.7f;
                     SpawnNativeSplash(v.End);
+                    SpawnWaterShockwaveRing(v.End, v.Kind == "shipSteal" ? new Color(0.95f, 0.42f, 0.24f) : new Color(0.35f, 0.88f, 0.68f), 3.4f);
+                    PlayFleetSound(v.Kind == "shipSteal" ? "raid_board" : "cargo_deliver", v.End, 0.85f);
                     try { v.OnArriveTarget?.Invoke(); } catch { }
                     if (v.Kind == "shipSteal")
                     {
                         if (v.CargoGroup != null) v.CargoGroup.SetActive(true);
-                        SpawnNativePopup(v.End + Vector3.up * 2.6f, "🏴‍☠️ 登船搜刮物资！");
+                        SpawnNativePopup(v.End + Vector3.up * 2.6f, $"登船搜刮: {v.Label}");
                     }
                     else
                     {
                         if (v.CargoGroup != null) v.CargoGroup.SetActive(false);
-                        SpawnNativePopup(v.End + Vector3.up * 2.6f, $"📦 物资送达: {v.Label}");
+                        SpawnNativePopup(v.End + Vector3.up * 2.6f, $"物资送达: {v.Label}");
                     }
                 }
             }
@@ -305,7 +311,7 @@ internal static class FleetPhysicalActors
                     SpawnNativeSplash(v.Start);
                     try { v.OnReturnHome?.Invoke(); } catch { }
                     if (v.Kind == "shipSteal")
-                        SpawnNativePopup(v.Start + Vector3.up * 2.5f, "🏴‍☠️ 掠夺艇满载返航！");
+                        SpawnNativePopup(v.Start + Vector3.up * 2.5f, "掠夺艇满载返航");
                     UnityEngine.Object.Destroy(v.Root);
                     Voyages.RemoveAt(i);
                 }
@@ -328,6 +334,8 @@ internal static class FleetPhysicalActors
                 s.Root.SetActive(true);
                 SpawnNativeSplash(s.Start);
                 SpawnImpactBurst(s.Start, 0.55f);
+                PlayFleetSound("cannon_fire", s.Start, 0.88f);
+                TriggerCameraShake(s.Start, 0.22f, 0.18f);
             }
             s.Elapsed += dt;
             var t = Mathf.Clamp01(s.Elapsed / Mathf.Max(0.1f, s.Duration));
@@ -348,17 +356,23 @@ internal static class FleetPhysicalActors
             {
                 SpawnNativeSplash(s.End);
                 SpawnImpactBurst(s.End, 1.35f);
+                SpawnWaterShockwaveRing(s.End, new Color(1f, 0.55f, 0.18f), 4.6f);
+                PlayFleetSound("shell_impact", s.End, 0.95f);
+                TriggerCameraShake(s.End, 0.42f, 0.30f);
                 if (s.OnImpact != null)
                 {
                     try { s.OnImpact.Invoke(); } catch { }
-                    SpawnNativePopup(s.End + Vector3.up * 2.8f, "💥 火炮命中！耐久受损 -25%");
+                    SpawnNativePopup(s.End + Vector3.up * 2.8f, "火炮命中 · 耐久受损 -25%");
                 }
                 UnityEngine.Object.Destroy(s.Root);
                 Shells.RemoveAt(i);
             }
         }
 
-        // 3. Sync WorldMap miniature ships when WorldMap is open
+        // 3. Apply damped camera shake when cannons fire or impact nearby
+        UpdateCameraShake(dt);
+
+        // 4. Sync WorldMap miniature ships when WorldMap is open
         SyncWorldMapShips();
     }
 
@@ -601,6 +615,163 @@ internal static class FleetPhysicalActors
     {
         try { TextPopup.Spawn(pos, text); }
         catch { }
+    }
+
+    internal static void TriggerCameraShake(Vector3 worldPos, float intensity, float duration)
+    {
+        try
+        {
+            var cam = Camera.main;
+            if (cam == null) return;
+            var horizDist = Vector2.Distance(new Vector2(cam.transform.position.x, cam.transform.position.z), new Vector2(worldPos.x, worldPos.z));
+            var falloff = Mathf.Clamp01(1f - horizDist / 120f);
+            if (falloff <= 0.05f) return;
+            _shakeIntensity = Mathf.Max(_shakeIntensity, intensity * falloff);
+            _shakeRemaining = Mathf.Max(_shakeRemaining, duration);
+        }
+        catch { }
+    }
+
+    private static void UpdateCameraShake(float dt)
+    {
+        if (_shakeRemaining <= 0f) return;
+        _shakeRemaining -= dt;
+        try
+        {
+            var camCtrl = CameraController.Instance;
+            if (camCtrl != null)
+            {
+                var damper = Mathf.Clamp01(_shakeRemaining / 0.3f);
+                var jitter = new Vector3(
+                    UnityEngine.Random.Range(-1f, 1f) * _shakeIntensity * damper,
+                    0f,
+                    UnityEngine.Random.Range(-1f, 1f) * _shakeIntensity * damper);
+                camCtrl.transform.position += jitter * (dt * 12f);
+            }
+        }
+        catch { }
+        if (_shakeRemaining <= 0f) _shakeIntensity = 0f;
+    }
+
+    private static void SpawnWaterShockwaveRing(Vector3 pos, Color color, float maxRadius)
+    {
+        var ringGo = new GameObject("Flotsam_WaterShockwave");
+        ringGo.transform.position = new Vector3(pos.x, 0.18f, pos.z);
+        var lr = ringGo.AddComponent<LineRenderer>();
+        lr.useWorldSpace = false;
+        lr.loop = true;
+        lr.material = GetEmissiveMaterial(color);
+        lr.startWidth = 0.28f;
+        lr.endWidth = 0.28f;
+        const int segments = 28;
+        lr.positionCount = segments;
+        var expander = ringGo.AddComponent<ShockwaveRingAnimator>();
+        expander.Line = lr;
+        expander.MaxRadius = maxRadius;
+        expander.BaseColor = color;
+    }
+
+    internal static void PlayFleetSound(string kind, Vector3 worldPos, float volume = 0.8f)
+    {
+        try
+        {
+            if (!CachedSfx.TryGetValue(kind, out var clip) || clip == null)
+            {
+                clip = FindOrSynthesizeAudioClip(kind);
+                CachedSfx[kind] = clip;
+            }
+            if (clip != null)
+                AudioSource.PlayClipAtPoint(clip, worldPos, Mathf.Clamp01(volume));
+        }
+        catch { }
+    }
+
+    private static AudioClip FindOrSynthesizeAudioClip(string kind)
+    {
+        try
+        {
+            var loaded = Resources.FindObjectsOfTypeAll<AudioClip>();
+            if (loaded != null && loaded.Length > 0)
+            {
+                string[] keywords = kind switch
+                {
+                    "cannon_fire" => new[] { "cannon", "shoot", "launch", "explosion", "thud" },
+                    "shell_impact" => new[] { "explosion", "impact", "crash", "destroy", "splash" },
+                    "cargo_deliver" => new[] { "complete", "pickup", "store", "bell", "pop" },
+                    "raid_board" => new[] { "alert", "warning", "sword", "hit", "salvage" },
+                    _ => new[] { "boat", "horn", "splash", "water" }
+                };
+                foreach (var kw in keywords)
+                {
+                    var match = loaded.FirstOrDefault(c => c != null && c.name != null && c.length > 0.08f && c.length < 4.5f && c.name.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (match != null) return match;
+                }
+            }
+        }
+        catch { }
+
+        // Procedural fallback waveform so audio feedback is guaranteed even if native FMOD banks are streamed
+        const int sampleRate = 22050;
+        var duration = kind == "shell_impact" ? 0.55f : kind == "cannon_fire" ? 0.42f : 0.35f;
+        var count = Mathf.CeilToInt(sampleRate * duration);
+        var samples = new float[count];
+        var rng = new System.Random(kind.GetHashCode());
+
+        for (var i = 0; i < count; i++)
+        {
+            var t = (float)i / sampleRate;
+            var env = Mathf.Exp(-t * (kind == "shell_impact" ? 5.5f : 8.0f));
+            var noise = (float)(rng.NextDouble() * 2.0 - 1.0);
+            if (kind == "cannon_fire" || kind == "shell_impact")
+            {
+                var freq = kind == "cannon_fire" ? Mathf.Lerp(140f, 38f, t / duration) : Mathf.Lerp(110f, 28f, t / duration);
+                var boom = Mathf.Sin(2f * Mathf.PI * freq * t);
+                samples[i] = Mathf.Clamp((boom * 0.65f + noise * 0.45f) * env, -1f, 1f);
+            }
+            else if (kind == "cargo_deliver")
+            {
+                var freq = i < count / 2 ? 523.25f : 659.25f;
+                samples[i] = Mathf.Sin(2f * Mathf.PI * freq * t) * env * 0.55f;
+            }
+            else
+            {
+                var horn = Mathf.Sin(2f * Mathf.PI * 196f * t) * 0.45f + Mathf.Sin(2f * Mathf.PI * 293.66f * t) * 0.35f;
+                samples[i] = (horn + noise * 0.15f) * env;
+            }
+        }
+
+        var synth = AudioClip.Create($"FlotsamSfx_{kind}", count, 1, sampleRate, false);
+        synth.SetData(samples, 0);
+        return synth;
+    }
+
+    private sealed class ShockwaveRingAnimator : MonoBehaviour
+    {
+        public LineRenderer? Line;
+        public float MaxRadius = 4f;
+        public Color BaseColor = Color.white;
+        private float _elapsed;
+        private const float Lifetime = 0.65f;
+
+        private void Update()
+        {
+            _elapsed += Time.deltaTime;
+            var t = Mathf.Clamp01(_elapsed / Lifetime);
+            if (Line != null)
+            {
+                var r = Mathf.Lerp(0.4f, MaxRadius, 1f - (1f - t) * (1f - t));
+                var count = Line.positionCount;
+                for (var i = 0; i < count; i++)
+                {
+                    var ang = i * Mathf.PI * 2f / count;
+                    Line.SetPosition(i, new Vector3(Mathf.Cos(ang) * r, 0f, Mathf.Sin(ang) * r));
+                }
+                var width = Mathf.Lerp(0.32f, 0.02f, t);
+                Line.startWidth = width;
+                Line.endWidth = width;
+            }
+            if (t >= 1f) Destroy(gameObject);
+        }
     }
 
     private static Material GetLitMaterial(Color color)

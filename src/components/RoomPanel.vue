@@ -7,7 +7,7 @@ import {
 import { command, desktop, errorText } from '../bridge';
 import { useLauncher } from '../store';
 import { t } from '../i18n';
-import type { Difference, NetInterface, RoomRules } from '../types';
+import type { ConnectivityProbe, Difference, NetInterface, RoomRules } from '../types';
 import PopoverBox from './PopoverBox.vue';
 import SlideDrawer from './SlideDrawer.vue';
 
@@ -54,6 +54,8 @@ const multiplayer = ref<Multiplayer | null>(null);
 const gameBusy = ref(false);
 const failures = ref<Difference[]>([]);
 const adapters = ref<NetInterface[]>([]);
+const probing = ref(false);
+const probeResult = ref<ConnectivityProbe | null>(null);
 
 // Contextual Overlays (Popovers & Drawers — zero page-stretching accordions)
 const netPop = ref(false);
@@ -66,6 +68,7 @@ const gameRunning = computed(() => store.running);
 const activeRules = computed(() => room.value?.rules || rules.value);
 const activeDiffs = computed(() => (room.value?.connected ? room.value.differences : failures.value));
 const syncPort = computed(() => Math.min(65535, Math.max(1024, Number(port.value) || 27025) + 2));
+const localVlanAdapter = computed(() => adapters.value.find((item) => item.kind === 'vlan') || null);
 
 const selectedAdapterLabel = computed(() => {
   const custom = advertise.value.trim();
@@ -114,11 +117,27 @@ async function pasteInvite() {
     if (clip) {
       invite.value = clip;
       store.notify(t('online.pasted'), 'success');
+      void probeConnectivity();
     } else {
       store.notify(t('online.pasteEmpty'), 'info');
     }
   } catch {
     store.notify(t('online.copyFailed'), 'error');
+  }
+}
+
+async function probeConnectivity() {
+  const raw = invite.value.trim();
+  if (!raw || probing.value) return;
+  probing.value = true;
+  error.value = '';
+  try {
+    probeResult.value = await command<ConnectivityProbe>('probe_room_connectivity', { target: raw });
+  } catch (e) {
+    error.value = errorText(e);
+    probeResult.value = null;
+  } finally {
+    probing.value = false;
   }
 }
 
@@ -534,11 +553,26 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
         <div class="lobby-row">
           <label class="field-label" for="invite">{{ t('online.invite') }}</label>
           <div class="inline-field">
-            <input id="invite" v-model="invite" class="room-input" placeholder="flotsam://…" required spellcheck="false"/>
+            <input id="invite" v-model="invite" class="room-input" placeholder="flotsam://…" required spellcheck="false" @input="probeResult = null"/>
             <button type="button" class="button secondary compact" @click="pasteInvite">
               <ClipboardPaste :size="14"/>{{ t('online.pasteInvite') }}
             </button>
+            <button type="button" class="button ghost compact" :disabled="probing || !invite.trim()" @click="probeConnectivity">
+              <LoaderCircle v-if="probing" :size="14" class="spin"/>
+              <Wifi v-else :size="14"/>
+              {{ probing ? t('online.probing') : t('online.probeBtn') }}
+            </button>
           </div>
+        </div>
+
+        <div v-if="probeResult" :class="['probe-banner', probeResult.reachable ? 'ok' : 'warn']" role="status">
+          <div class="probe-text">
+            <strong>{{ probeResult.targetAddress }}</strong>
+            <span>{{ probeResult.diagnosis }}</span>
+          </div>
+          <button v-if="probeResult.suggestVlan" type="button" class="text-button" @click="tutorialDrawer = true">
+            <BookOpen :size="13"/>{{ t('online.tutorialBtn') }}
+          </button>
         </div>
       </template>
 
@@ -548,7 +582,11 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
           <Wifi :size="13"/>
           <span>{{ t('online.usingIp', { label: selectedAdapterLabel }) }}</span>
         </button>
-        <span v-else class="preview-hint">{{ t('home.fleetDesc') }}</span>
+        <span v-else-if="localVlanAdapter" class="ip-status-pill">
+          <Wifi :size="13"/>
+          <span>{{ t('online.vlanReadyBadge', { name: `${localVlanAdapter.name} (${localVlanAdapter.ip})` }) }}</span>
+        </span>
+        <span v-else class="preview-hint">{{ t('online.lanOnlyBadge') }}</span>
 
         <button class="button primary connect-btn" :disabled="busy || !desktop || (role === 'join' && !invite.trim())">
           <LoaderCircle v-if="busy" class="spin" :size="17"/>
@@ -1179,6 +1217,40 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
 .diff-card p {
   font-size: 12px;
   color: var(--muted);
+}
+
+.probe-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 2px solid var(--outline);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.probe-banner.ok {
+  background: #dff8ec;
+  color: var(--ink);
+}
+
+.probe-banner.warn {
+  background: #fff2cf;
+  color: var(--ink);
+}
+
+.probe-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.probe-text strong {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
 }
 
 @media (max-width: 820px) {

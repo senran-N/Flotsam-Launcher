@@ -42,6 +42,7 @@ fn main() {
             restore_save_backup,
             room_status,
             network_interfaces,
+            probe_room_connectivity,
             host_room,
             join_room,
             leave_room,

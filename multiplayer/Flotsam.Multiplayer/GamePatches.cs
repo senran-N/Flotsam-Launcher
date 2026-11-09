@@ -72,7 +72,27 @@ internal static class GamePatches
         foreach(var method in AccessTools.GetDeclaredMethods(typeof(PlayerRun)))if(method.Name=="Save")harmony.Patch(method,prefix:new HarmonyMethod(typeof(GamePatches),nameof(CanSave)));
     }
     private static bool Simulate()=>!Client;
-    private static bool CanSave()=>Network?.IsClient!=true;
+    private static bool CanSave()
+    {
+        if(Network?.IsClient==true)return false;
+        if(Network!=null||FleetRuntime.Active)
+        {
+            try
+            {
+                var savesDir=System.IO.Path.Combine(UnityEngine.Application.persistentDataPath,"Saves");
+                if(System.IO.Directory.Exists(savesDir))
+                {
+                    System.IO.DirectoryInfo? newest=null;
+                    foreach(var dir in new System.IO.DirectoryInfo(savesDir).GetDirectories())
+                        if(newest==null||dir.LastWriteTimeUtc>newest.LastWriteTimeUtc)newest=dir;
+                    if(newest!=null)
+                        System.IO.File.WriteAllText(System.IO.Path.Combine(newest.FullName,".flotsam-multiplayer"),Plugin.Options.mode??"independent");
+                }
+            }
+            catch{}
+        }
+        return true;
+    }
     private static bool PlaceBoat(BoatCursorProperties __instance,object[] __args)
     {
         if(!Client)return true;

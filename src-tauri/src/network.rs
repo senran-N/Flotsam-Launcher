@@ -1290,14 +1290,16 @@ pub async fn join_room(
     let hash = manifest.fingerprint.clone();
     let mut socket = match timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
         Ok(Ok(socket)) => socket,
-        Ok(Err(_)) => {
-            let message = "无法连接房主，请检查 IP、端口和房间是否开启".to_string();
+        Ok(Err(e)) => {
+            let interfaces = detect_network_interfaces();
+            let refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+            let (_, _, message, _) = diagnose_unreachable_target(address.ip(), &interfaces, refused);
             state.record_failure("unreachable", &message, &[]);
             return Err(message);
         }
         Err(_) => {
-            let message =
-                "连接超时，请检查双方网络、端口和防火墙（公网需房主自行完成端口转发）".to_string();
+            let interfaces = detect_network_interfaces();
+            let (_, _, message, _) = diagnose_unreachable_target(address.ip(), &interfaces, false);
             state.record_failure("timeout", &message, &[]);
             return Err(message);
         }
@@ -1548,6 +1550,201 @@ pub fn room_chat(state: tauri::State<NetworkState>, text: String) -> Result<()> 
         .commands
         .try_send(text)
         .map_err(|_| "消息发送过快，请稍后再试".into())
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectivityProbe {
+    pub reachable: bool,
+    pub status: String,
+    pub rtt_ms: u32,
+    pub target_address: String,
+    pub route_kind: String,
+    pub diagnosis: String,
+    pub suggest_vlan: bool,
+    pub local_vlan_ips: Vec<String>,
+}
+
+pub(crate) fn classify_target_route(
+    ip: std::net::IpAddr,
+    interfaces: &[NetInterface],
+) -> &'static str {
+    let std::net::IpAddr::V4(v4) = ip else {
+        return "public";
+    };
+    if v4.is_loopback() {
+        return "loopback";
+    }
+    let o = v4.octets();
+    let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
+    let has_local_cgnat_vlan = interfaces.iter().any(|iface| {
+        iface.kind == "vlan"
+            && iface
+                .ip
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|lip| lip.octets()[0] == 100 && (64..=127).contains(&lip.octets()[1]))
+    });
+    if o[0] == 26 || o[0] == 25 || (is_cgnat && has_local_cgnat_vlan) {
+        return "vlan";
+    }
+    for iface in interfaces {
+        if let Ok(lip) = iface.ip.parse::<std::net::Ipv4Addr>() {
+            let lo = lip.octets();
+            if iface.kind == "vlan" && lo[0] == o[0] && lo[1] == o[1] {
+                return "vlan";
+            }
+        }
+    }
+    for iface in interfaces {
+        if let Ok(lip) = iface.ip.parse::<std::net::Ipv4Addr>() {
+            let lo = lip.octets();
+            if iface.kind == "lan" && lo[0] == o[0] && lo[1] == o[1] {
+                return "lan_same_subnet";
+            }
+        }
+    }
+    if v4.is_private() || is_cgnat {
+        return "lan_cross_subnet";
+    }
+    "public"
+}
+
+pub(crate) fn diagnose_unreachable_target(
+    ip: std::net::IpAddr,
+    interfaces: &[NetInterface],
+    refused: bool,
+) -> (&'static str, &'static str, String, bool) {
+    let route = classify_target_route(ip, interfaces);
+    if refused {
+        return (
+            "port_closed",
+            route,
+            "网络路由可达（主机已响应），但房间端口未开启 — 请确认房主已点击「创建房间」且端口号一致".into(),
+            false,
+        );
+    }
+    match route {
+        "lan_same_subnet" => (
+            "ap_isolation",
+            route,
+            "同网段连接超时：检测到校园网 / 公共 Wi-Fi「AP 隔离」或房主防火墙拦截。建议双方开启 Tailscale / Radmin VPN / ZeroTier 虚拟局域网并选择虚拟网卡 IP 创建房间".into(),
+            true,
+        ),
+        "lan_cross_subnet" => (
+            "nat_isolated",
+            route,
+            "跨内网连接超时：目标为私有内网地址，异地或不同路由器下无法直连。请双方启动虚拟局域网（Tailscale / Radmin VPN / ZeroTier）组网后再连接".into(),
+            true,
+        ),
+        "vlan" => (
+            "vlan_timeout",
+            route,
+            "虚拟局域网连接超时：请确认双方虚拟组网软件（Tailscale / Radmin / ZeroTier）处于同一网络且在线，并检查房主 Windows 防火墙".into(),
+            false,
+        ),
+        _ => (
+            "public_nat",
+            route,
+            "连接超时：公网直连需房主拥有公网 IP 并完成 TCP 端口转发（房间端口及 +2 游戏端口）；若处于校园网或运营商大内网（NAT），请改用虚拟局域网直连".into(),
+            true,
+        ),
+    }
+}
+
+fn parse_probe_target(raw: &str) -> Result<std::net::SocketAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("请先输入房主邀请码或 IP:端口".into());
+    }
+    if let Some(rest) = trimmed.strip_prefix("flotsam://") {
+        let addr_part = rest.split('/').next().unwrap_or(rest).trim();
+        let addr: std::net::SocketAddr = addr_part
+            .parse()
+            .map_err(|_| "邀请码中的 IP 或端口无效".to_string())?;
+        if addr.port() == 0 || addr.ip().is_unspecified() {
+            return Err("邀请码中的 IP 或端口无效".into());
+        }
+        return Ok(addr);
+    }
+    if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
+        if addr.port() == 0 || addr.ip().is_unspecified() {
+            return Err("目标 IP 或端口无效".into());
+        }
+        return Ok(addr);
+    }
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        if ip.is_unspecified() {
+            return Err("目标 IP 无效".into());
+        }
+        return Ok(std::net::SocketAddr::new(ip, 27025));
+    }
+    Err("请输入有效的 flotsam:// 邀请码或 IP:端口".into())
+}
+
+#[tauri::command]
+pub async fn probe_room_connectivity(target: String) -> Result<ConnectivityProbe> {
+    let address = parse_probe_target(&target)?;
+    let interfaces = detect_network_interfaces();
+    let local_vlan_ips: Vec<String> = interfaces
+        .iter()
+        .filter(|i| i.kind == "vlan")
+        .map(|i| format!("{} ({})", i.ip, i.name))
+        .collect();
+    let route_kind = classify_target_route(address.ip(), &interfaces);
+    let started = std::time::Instant::now();
+    match timeout(Duration::from_millis(1600), TcpStream::connect(address)).await {
+        Ok(Ok(stream)) => {
+            let rtt_ms = (started.elapsed().as_millis() as u32).max(1);
+            drop(stream);
+            let route_label = match route_kind {
+                "vlan" => "虚拟局域网直连",
+                "lan_same_subnet" => "局域网同网段直连",
+                "loopback" => "本机回环直连",
+                _ => "网络直连",
+            };
+            Ok(ConnectivityProbe {
+                reachable: true,
+                status: "ok".into(),
+                rtt_ms,
+                target_address: address.to_string(),
+                route_kind: route_kind.into(),
+                diagnosis: format!(
+                    "{route_label}畅通（握手延迟 {rtt_ms} ms）— 房间端口已就绪，可直接加入房间"
+                ),
+                suggest_vlan: false,
+                local_vlan_ips,
+            })
+        }
+        Ok(Err(e)) => {
+            let refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+            let (status, route, diagnosis, suggest_vlan) =
+                diagnose_unreachable_target(address.ip(), &interfaces, refused);
+            Ok(ConnectivityProbe {
+                reachable: false,
+                status: status.into(),
+                rtt_ms: 0,
+                target_address: address.to_string(),
+                route_kind: route.into(),
+                diagnosis,
+                suggest_vlan,
+                local_vlan_ips,
+            })
+        }
+        Err(_) => {
+            let (status, route, diagnosis, suggest_vlan) =
+                diagnose_unreachable_target(address.ip(), &interfaces, false);
+            Ok(ConnectivityProbe {
+                reachable: false,
+                status: status.into(),
+                rtt_ms: 0,
+                target_address: address.to_string(),
+                route_kind: route.into(),
+                diagnosis,
+                suggest_vlan,
+                local_vlan_ips,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1817,5 +2014,43 @@ mod tests {
             classify_interface("以太网", "Realtek PCIe GbE", Ipv4Addr::new(192, 168, 16, 2)),
             Some("lan")
         );
+    }
+    #[test]
+    fn connectivity_diagnostics_distinguish_ap_isolation_cross_nat_and_vlan() {
+        let interfaces = vec![
+            NetInterface {
+                name: "WLAN".into(),
+                ip: "100.81.18.41".into(),
+                kind: "lan".into(),
+            },
+            NetInterface {
+                name: "Radmin VPN".into(),
+                ip: "26.44.12.8".into(),
+                kind: "vlan".into(),
+            },
+        ];
+        let (status, route, diag, suggest) =
+            diagnose_unreachable_target("100.81.20.99".parse().unwrap(), &interfaces, false);
+        assert_eq!(status, "ap_isolation");
+        assert_eq!(route, "lan_same_subnet");
+        assert!(suggest);
+        assert!(diag.contains("AP 隔离"));
+
+        let (status2, route2, _, suggest2) =
+            diagnose_unreachable_target("192.168.1.50".parse().unwrap(), &interfaces, false);
+        assert_eq!(status2, "nat_isolated");
+        assert_eq!(route2, "lan_cross_subnet");
+        assert!(suggest2);
+
+        let (status3, route3, _, suggest3) =
+            diagnose_unreachable_target("26.44.99.1".parse().unwrap(), &interfaces, false);
+        assert_eq!(status3, "vlan_timeout");
+        assert_eq!(route3, "vlan");
+        assert!(!suggest3);
+
+        let (status4, _, _, suggest4) =
+            diagnose_unreachable_target("100.81.20.99".parse().unwrap(), &interfaces, true);
+        assert_eq!(status4, "port_closed");
+        assert!(!suggest4);
     }
 }

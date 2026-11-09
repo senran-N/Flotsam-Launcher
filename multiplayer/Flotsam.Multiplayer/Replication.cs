@@ -423,10 +423,11 @@ internal sealed class Replication
     }
     private string? ExecuteFleetInteraction(GameCommand command,Community actor,Vector3 actorPos)
     {
+        var reqAmount=Mathf.Clamp(command.amount<=0?5:command.amount,1,9999);
         if(command.text=="__practice__")
         {
             var practiceEnd=FleetPhysicalActors.GetOrSpawnPracticeTarget(actorPos);
-            var label=command.properties=="Plastic"?"塑料 ×5":command.properties=="Food"?"食水补给":"木材 ×5";
+            var label=$"{FormatCategoryLabel(command.properties)} ×{reqAmount}";
             FleetPhysicalActors.RecordAndSpawn(command.kind,label,actorPos,practiceEnd);
             return null;
         }
@@ -440,13 +441,13 @@ internal sealed class Replication
         var otherPos=clickedBuilding!=null?clickedBuilding.transform.position:(FleetEngineBundle.RootFor(other)?.transform.position??Construction.TownheartPosition);
         if(command.kind=="shipTransfer")
         {
-            var amount=Mathf.Clamp(command.amount<=0?5:command.amount,1,20);
-            var extracted=ExtractItemsFromShip(actor,command.properties,amount);
-            if(extracted.Count==0)return "我方船只库存中没有足够的该类物资";
-            var itemLabel=command.properties=="Plastic"?$"塑料 ×{extracted.Count}":command.properties=="Food"?$"食物 ×{extracted.Count}":command.properties=="Drink"?$"淡水 ×{extracted.Count}":$"木材 ×{extracted.Count}";
+            var extracted=ExtractItemsFromShip(actor,command.properties,reqAmount);
+            if(extracted.Count==0)return $"我方船只库存中没有可调配的 {FormatCategoryLabel(command.properties)}";
+            var itemLabel=$"{FormatCategoryLabel(command.properties)} ×{extracted.Count}";
             FleetPhysicalActors.RecordAndSpawn("shipTransfer",itemLabel,actorPos,otherPos,onArriveTarget:()=>
             {
                 foreach(var prop in extracted)if(prop!=null)other.SpawnItemToAvailableStorage(prop);
+                FleetPhysicalActors.SpawnNativePopup(otherPos+Vector3.up*2.8f,$"收到商船卸货：{itemLabel}");
             });
             return null;
         }
@@ -454,16 +455,21 @@ internal sealed class Replication
         if(command.kind=="shipSteal")
         {
             if(!HasStealableItems(other))return "对方船舱暂无可掠夺的未锁定物资";
-            var maxLoot=Mathf.Clamp(command.amount<=0?3:command.amount,1,5);
+            var maxLoot=reqAmount;
+            var prefLabel=string.IsNullOrEmpty(command.properties)?"物资":FormatCategoryLabel(command.properties);
             var loot=new List<ItemProperties>();
-            FleetPhysicalActors.RecordAndSpawn("shipSteal","劫掠物资",actorPos,otherPos,
+            FleetPhysicalActors.RecordAndSpawn("shipSteal",$"劫掠{prefLabel} ×{maxLoot}",actorPos,otherPos,
                 onArriveTarget:()=>
                 {
                     loot=ExtractItemsFromShip(other,command.properties,maxLoot);
+                    if(loot.Count<maxLoot&&!string.IsNullOrEmpty(command.properties))
+                        loot.AddRange(ExtractItemsFromShip(other,"",maxLoot-loot.Count));
                 },
                 onReturnHome:()=>
                 {
                     foreach(var prop in loot)if(prop!=null)actor.SpawnItemToAvailableStorage(prop);
+                    if(loot.Count>0)
+                        FleetPhysicalActors.SpawnNativePopup(actorPos+Vector3.up*2.8f,$"劫掠归航：夺得物资 ×{loot.Count}");
                 });
             return null;
         }
@@ -474,7 +480,8 @@ internal sealed class Replication
                 ?clickedBuilding
                 :other.Buildables.FirstOrDefault(b=>b!=null&&b!=otherRoot&&!MoveConstructionCommands.IsStored(b));
             var hitPos=targetBuilding!=null?targetBuilding.transform.position:otherPos;
-            FleetPhysicalActors.RecordAndSpawn("shipAttack","火炮齐射",actorPos,hitPos,onArriveTarget:()=>
+            var bName=targetBuilding?.Name??"船体";
+            FleetPhysicalActors.RecordAndSpawn("shipAttack",$"轰击 {bName}",actorPos,hitPos,onArriveTarget:()=>
             {
                 if(targetBuilding!=null)
                 {
@@ -490,6 +497,44 @@ internal sealed class Replication
             return null;
         }
         return "未知跨船操作";
+    }
+    internal static string FormatCategoryLabel(string? selector)=>selector switch
+    {
+        "Plastic"=>"塑料",
+        "Metal"=>"金属",
+        "Food"=>"食物",
+        "Drink"=>"淡水",
+        "Tech"=>"电子/科技",
+        _=>"木材"
+    };
+    internal static int CountItemsOnShip(Community? from,string? selector)
+    {
+        if(from==null)return 0;
+        var total=0;
+        foreach(var building in from.Buildables)
+        {
+            if(building==null)continue;
+            foreach(var section in building.Inventory.SubInventoryTypes)
+                foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()))
+                    if(item?.Properties!=null&&!item.IsReserved&&MatchesCategory(item.Properties,selector))
+                        total++;
+        }
+        return total;
+    }
+    private static bool MatchesCategory(ItemProperties p,string? selector)
+    {
+        if(string.IsNullOrEmpty(selector))return true;
+        var n=p.name??"";
+        return selector switch
+        {
+            "Food"=>(p.Tags&Item.Tags.Food)!=0,
+            "Drink"=>(p.Tags&Item.Tags.Drink)!=0,
+            "Wood"=>n=="DryWood"||n=="WetWood"||n=="Planks"||n.IndexOf("Wood",StringComparison.OrdinalIgnoreCase)>=0,
+            "Plastic"=>n=="Plastic"||n.IndexOf("Plastic",StringComparison.OrdinalIgnoreCase)>=0,
+            "Metal"=>n=="Metal"||n=="ScrapMetal"||n.IndexOf("Metal",StringComparison.OrdinalIgnoreCase)>=0||n.IndexOf("Iron",StringComparison.OrdinalIgnoreCase)>=0,
+            "Tech"=>n=="Electronics"||n.IndexOf("Book",StringComparison.OrdinalIgnoreCase)>=0||n.IndexOf("Tech",StringComparison.OrdinalIgnoreCase)>=0||n.IndexOf("Electro",StringComparison.OrdinalIgnoreCase)>=0,
+            _=>n==selector
+        };
     }
     private static bool HasStealableItems(Community from)
     {
@@ -516,12 +561,7 @@ internal sealed class Replication
                     if(extracted.Count>=maxCount)break;
                     if(item==null||item.IsReserved)continue;
                     var p=item.Properties;
-                    var match=string.IsNullOrEmpty(selector)
-                        ||(selector=="Food"&&(p.Tags&Item.Tags.Food)!=0)
-                        ||(selector=="Drink"&&(p.Tags&Item.Tags.Drink)!=0)
-                        ||(selector=="Wood"&&(p.name=="DryWood"||p.name=="WetWood"||p.name=="Planks"))
-                        ||p.name==selector;
-                    if(!match)continue;
+                    if(!MatchesCategory(p,selector))continue;
                     if(building.Inventory.RemoveItem(p,section)!=null)
                         extracted.Add(p);
                 }

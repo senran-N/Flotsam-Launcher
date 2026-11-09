@@ -214,8 +214,17 @@ function saveTypeLabel(kind?: string | null) {
   return '';
 }
 
+function saveModeLabel(item: { isMultiplayer?: boolean; shipCount?: number }) {
+  if (item.isMultiplayer) {
+    return item.shipCount && item.shipCount > 1
+      ? t('saves.modeFleet', { ships: item.shipCount })
+      : t('saves.modeMulti');
+  }
+  return t('saves.modeSingle');
+}
+
 function homeSaveSubtitle(save: SaveEntry) {
-  const parts: string[] = [];
+  const parts: string[] = [saveModeLabel(save)];
   if (save.day != null) parts.push(t('saves.day', { day: save.day }));
   if (save.drifters != null) parts.push(t('saves.drifters', { count: save.drifters }));
   parts.push(shortDateTime(save.modified));
@@ -632,6 +641,7 @@ function open(kind: string, subpath?: string) {
                     <div class="save-title-wrap">
                       <div class="save-title-row">
                         <h2>{{ save.name }}</h2>
+                        <span :class="['save-type-pill', save.isMultiplayer ? 'mode-multi' : 'mode-single']">{{ saveModeLabel(save) }}</span>
                         <span v-if="saveTypeLabel(save.saveType)" :class="['save-type-pill', save.saveType]">{{ saveTypeLabel(save.saveType) }}</span>
                       </div>
                       <div class="save-pills">
@@ -888,7 +898,10 @@ function open(kind: string, subpath?: string) {
           <div v-for="slot in inspectedSave.slots" :key="slot.fileName" class="drawer-plugin-card" style="display:flex;flex-direction:column;gap:5px">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
               <strong style="font-size:13.5px">{{ slot.slotName }}</strong>
-              <span v-if="saveTypeLabel(slot.saveType)" :class="['save-type-pill', slot.saveType]">{{ saveTypeLabel(slot.saveType) }}</span>
+              <div style="display:flex;gap:5px;align-items:center">
+                <span :class="['save-type-pill', slot.isMultiplayer ? 'mode-multi' : 'mode-single']">{{ saveModeLabel(slot) }}</span>
+                <span v-if="saveTypeLabel(slot.saveType)" :class="['save-type-pill', slot.saveType]">{{ saveTypeLabel(slot.saveType) }}</span>
+              </div>
             </div>
             <div style="font-size:12px;color:var(--ink-soft)">
               <template v-if="slot.day != null">{{ t('saves.day', { day: slot.day }) }} · </template>
@@ -998,6 +1011,17 @@ function open(kind: string, subpath?: string) {
   gap: 8px;
   padding-top: 8px;
   border-top: 1.5px dashed var(--line);
+}
+
+.save-type-pill.mode-multi {
+  background: #dff8ec;
+  border-color: var(--outline);
+  color: var(--ink);
+}
+
+.save-type-pill.mode-single {
+  background: #f4ead2;
+  color: var(--ink-soft);
 }
 
 @media (max-width: 860px) {

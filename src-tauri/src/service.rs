@@ -69,6 +69,8 @@ pub struct SaveSlot {
     pub modified: u64,
     pub size: u64,
     pub game_version: Option<String>,
+    pub is_multiplayer: bool,
+    pub ship_count: u32,
 }
 
 #[derive(Serialize)]
@@ -86,6 +88,8 @@ pub struct SaveEntry {
     drifters: Option<u32>,
     play_time_seconds: Option<u64>,
     game_version: Option<String>,
+    is_multiplayer: bool,
+    ship_count: u32,
     slots: Vec<SaveSlot>,
 }
 #[derive(Serialize)]
@@ -288,6 +292,71 @@ fn parse_dotnet_date_seconds(raw: &str) -> Option<u64> {
     Some(ms / 1000)
 }
 
+fn detect_save_multiplayer(
+    text: &str,
+    community: Option<&str>,
+    slot_name: &str,
+    game_version: Option<&str>,
+) -> (bool, u32) {
+    use std::io::Read;
+    let mut is_mp = false;
+    let mut ship_count = 1u32;
+
+    for s in [community, Some(slot_name), game_version].into_iter().flatten() {
+        let lower = s.to_ascii_lowercase();
+        if s.contains("Ship:")
+            || s.contains("[多人")
+            || s.contains("[联机")
+            || lower.contains("+mp")
+            || lower.contains("multiplayer")
+        {
+            is_mp = true;
+        }
+    }
+
+    if let Some(data_start) = text.find("\"_data\":[") {
+        let rest = &text[data_start + 9..];
+        if let Some(end_bracket) = rest.find(']') {
+            let slice = &rest[..end_bracket];
+            if slice.len() <= 16 * 1024 * 1024 {
+                let mut raw_bytes = Vec::with_capacity(slice.len() / 3);
+                let mut cur: u16 = 0;
+                let mut in_num = false;
+                for &b in slice.as_bytes() {
+                    if b.is_ascii_digit() {
+                        cur = cur.saturating_mul(10).saturating_add((b - b'0') as u16);
+                        in_num = true;
+                    } else if in_num {
+                        raw_bytes.push((cur & 0xFF) as u8);
+                        cur = 0;
+                        in_num = false;
+                    }
+                }
+                if in_num {
+                    raw_bytes.push((cur & 0xFF) as u8);
+                }
+                let mut inner = String::new();
+                if raw_bytes.len() >= 2 && raw_bytes[0] == 0x1F && raw_bytes[1] == 0x8B {
+                    let _ = flate2::read::GzDecoder::new(raw_bytes.as_slice())
+                        .take(16 * 1024 * 1024)
+                        .read_to_string(&mut inner);
+                } else if let Ok(utf8) = std::str::from_utf8(&raw_bytes) {
+                    inner = utf8.to_string();
+                }
+                if !inner.is_empty() {
+                    let secondary = inner.matches("\"Ship:").count() as u32;
+                    if secondary > 0 {
+                        is_mp = true;
+                        ship_count = 1 + secondary;
+                    }
+                }
+            }
+        }
+    }
+
+    (is_mp, ship_count)
+}
+
 pub(crate) fn parse_flotsam_save_bytes(
     bytes: &[u8],
     file_name: &str,
@@ -352,6 +421,12 @@ pub(crate) fn parse_flotsam_save_bytes(
         Some(format!("{major}.{minor}.{patch}{suffix}"))
     });
     let community = info.community_name.filter(|s| !s.trim().is_empty());
+    let (is_multiplayer, ship_count) = detect_save_multiplayer(
+        &text,
+        community.as_deref(),
+        &slot_name,
+        game_version.as_deref(),
+    );
 
     Some((
         community,
@@ -368,6 +443,8 @@ pub(crate) fn parse_flotsam_save_bytes(
             modified,
             size: fallback_size,
             game_version,
+            is_multiplayer,
+            ship_count,
         },
     ))
 }
@@ -538,12 +615,25 @@ pub(crate) fn get_snapshot_sync(app: tauri::AppHandle, state: &LauncherState) ->
                 }
             }
             slots.sort_by_key(|s| std::cmp::Reverse(s.modified));
+            let has_mp_marker = dir_path.join(".flotsam-multiplayer").is_file();
+            if has_mp_marker {
+                for s in &mut slots {
+                    s.is_multiplayer = true;
+                }
+            }
             let latest = slots.first().cloned();
             if detected_game_version.is_none() {
                 detected_game_version = latest.as_ref().and_then(|s| s.game_version.clone());
             }
             let folder = entry.file_name().to_string_lossy().into_owned();
             let community_name = latest_community.map(|(_, c)| c);
+            let is_multiplayer = has_mp_marker || slots.iter().any(|s| s.is_multiplayer);
+            let ship_count = slots
+                .iter()
+                .map(|s| s.ship_count)
+                .max()
+                .unwrap_or(1)
+                .max(1);
             saves.push(SaveEntry {
                 name: community_name.clone().unwrap_or_else(|| folder.clone()),
                 folder,
@@ -557,6 +647,8 @@ pub(crate) fn get_snapshot_sync(app: tauri::AppHandle, state: &LauncherState) ->
                 drifters: latest.as_ref().and_then(|s| s.drifters),
                 play_time_seconds: latest.as_ref().and_then(|s| s.play_time_seconds),
                 game_version: latest.and_then(|s| s.game_version),
+                is_multiplayer,
+                ship_count,
                 slots,
             });
         }
@@ -1380,6 +1472,25 @@ mod tests {
         assert_eq!(slot.play_time_seconds, Some(5432));
         assert_eq!(slot.modified, 1794030898);
         assert_eq!(slot.game_version.as_deref(), Some("1.0.1f9"));
+        assert!(!slot.is_multiplayer);
+        assert_eq!(slot.ship_count, 1);
+
+        let inner_world = r#"{"_communities":[{"_name":"海上灯塔镇"},{"_name":"Ship:peer1:同行者甲"},{"_name":"Ship:peer2:同行者乙"}]}"#;
+        let mut inner_gz = GzEncoder::new(Vec::new(), Compression::fast());
+        inner_gz.write_all(inner_world.as_bytes()).unwrap();
+        let inner_bytes = inner_gz.finish().unwrap();
+        let data_json = inner_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mp_payload = format!(
+            r#"{{"_data":[{data_json}],"_info":{{"_communityName":"海上灯塔镇","_day":22,"_drifterCount":12,"_name":"Fleet Save","_playTime":9120.0,"_timestamp":"\/Date(1794030898747+0800)\/","_type":0}}}}"#
+        );
+        let (_, mp_slot) =
+            parse_flotsam_save_bytes(mp_payload.as_bytes(), "Fleet Save.fs", 100, 1024).unwrap();
+        assert!(mp_slot.is_multiplayer);
+        assert_eq!(mp_slot.ship_count, 3);
     }
     #[test]
     fn compares_semver_and_prerelease_versions_accurately() {

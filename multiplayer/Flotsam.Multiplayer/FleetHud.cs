@@ -45,7 +45,21 @@ internal sealed class FleetHud : MonoBehaviour
     private static TextMeshProUGUI? _nativeTitle;
     private static RectTransform? _nativeRow1;
     private static RectTransform? _nativeRow2;
-    private static readonly List<Button> _nativeButtons = new List<Button>();
+    private static RectTransform? _nativeRow3;
+    private static readonly List<GameObject> _nativeNodes = new List<GameObject>();
+    private static readonly List<Action<int>> _amountListeners = new List<Action<int>>();
+
+    private static readonly (string Key, string Label)[] TradeCategories = new[]
+    {
+        ("Wood", "木材"),
+        ("Plastic", "塑料"),
+        ("Metal", "金属"),
+        ("Food", "食物"),
+        ("Drink", "淡水"),
+        ("Tech", "电子")
+    };
+    private static int _selectedCategoryIdx;
+    private static int _selectedAmount = 5;
 
     private static readonly Color ColInk = new Color(0.118f, 0.145f, 0.212f, 1f);
     private static readonly Color ColDriftwood = new Color(0.220f, 0.137f, 0.090f, 0.94f);
@@ -143,7 +157,7 @@ internal sealed class FleetHud : MonoBehaviour
         if (upgradeBtn == null || nameTmp == null) return;
 
         EnsureNativeDrawer(panel, headerImg, nameTmp);
-        if (_nativeDrawer == null || _nativeRow1 == null || _nativeRow2 == null || _nativeTitle == null) return;
+        if (_nativeDrawer == null || _nativeRow1 == null || _nativeRow2 == null || _nativeRow3 == null || _nativeTitle == null) return;
 
         ClearNativeButtons();
 
@@ -162,42 +176,61 @@ internal sealed class FleetHud : MonoBehaviour
         var rules = Plugin.Options.rules;
         var isInd = Plugin.Options.mode == "independent";
 
+        var cat = TradeCategories[_selectedCategoryIdx % TradeCategories.Length];
+        var myStock = Replication.CountItemsOnShip(myCommunity, cat.Key);
+        _selectedAmount = Mathf.Clamp(_selectedAmount, 1, 9999);
+
         if (isForeignBuilding && isInd)
         {
             var targetShipName = buildable.Community!.Name ?? "";
             var ownerLabel = ResolveOwnerLabel(targetShipName);
             var targetId = net.Id(buildable);
-            _nativeTitle.text = $"⚓ 友船建筑交互 · {ownerLabel}";
+            var targetStock = Replication.CountItemsOnShip(buildable.Community, cat.Key);
+            var sliderMax = Mathf.Max(20, Mathf.Max(myStock, targetStock));
 
+            void UpdateForeignHeader(int curAmt) =>
+                _nativeTitle!.text = $"友船交互 · {ownerLabel} (我方{cat.Label}:{myStock} · 对方:{targetStock} · 数量:{curAmt})";
+            UpdateForeignHeader(_selectedAmount);
+            _amountListeners.Add(UpdateForeignHeader);
+
+            // Row 1: Category selector + Continuous Slider + Arbitrary Integer Input + Max button
+            SpawnNativeButton(_nativeRow1, upgradeBtn, $"品类: {cat.Label} [切换]", () =>
+            {
+                _selectedCategoryIdx = (_selectedCategoryIdx + 1) % TradeCategories.Length;
+                PopulateNativeBuildablePanel(panel);
+            });
+            SpawnAmountSliderAndInput(_nativeRow1, upgradeBtn, sliderMax);
+
+            // Row 2: Execute Trade / Raid / Artillery with chosen category & arbitrary amount
             if (rules.trading)
             {
-                SpawnNativeButton(_nativeRow1, upgradeBtn, "遣船运木 ×5", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = targetShipName, target = targetId, properties = "Wood", amount = 5 }, $"已从码头派出木材运输船前往 {ownerLabel}"));
-                SpawnNativeButton(_nativeRow1, upgradeBtn, "遣船运塑 ×5", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = targetShipName, target = targetId, properties = "Plastic", amount = 5 }, $"已从码头派出塑料运输船前往 {ownerLabel}"));
-                SpawnNativeButton(_nativeRow1, upgradeBtn, "遣船送食水", () =>
-                {
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = targetShipName, target = targetId, properties = "Food", amount = 3 });
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = targetShipName, target = targetId, properties = "Drink", amount = 3 }, $"已派出食水补给船前往 {ownerLabel}");
-                });
+                SpawnDynamicAmountButton(_nativeRow2, upgradeBtn,
+                    n => $"遣船运送 {cat.Label} ×{n}",
+                    () => net.ExecuteOrSubmit(
+                        new GameCommand { kind = "shipTransfer", text = targetShipName, target = targetId, properties = cat.Key, amount = _selectedAmount },
+                        $"已派出商船运送 {cat.Label} ×{_selectedAmount} 前往 {ownerLabel}"));
             }
 
             if (rules.stealing)
             {
-                SpawnNativeButton(_nativeRow2, upgradeBtn, "派艇登船掠夺", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipSteal", text = targetShipName, target = targetId, amount = 3 }, $"已派出劫掠快艇登船搜刮 {buildable.Name}"));
+                SpawnDynamicAmountButton(_nativeRow2, upgradeBtn,
+                    n => $"派艇劫掠 {cat.Label} ×{n}",
+                    () => net.ExecuteOrSubmit(
+                        new GameCommand { kind = "shipSteal", text = targetShipName, target = targetId, properties = cat.Key, amount = _selectedAmount },
+                        $"已派出快艇前往 {buildable.Name} 优先搜刮 {cat.Label} ×{_selectedAmount}"));
             }
 
             if (rules.friendlyFire)
             {
-                SpawnNativeButton(_nativeRow2, upgradeBtn, "火炮轰击此建筑", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipAttack", text = targetShipName, target = targetId }, $"已向 {buildable.Name} 发射船首火炮齐射！"));
+                SpawnNativeButton(_nativeRow3, upgradeBtn, "火炮轰击此建筑", () =>
+                    net.ExecuteOrSubmit(new GameCommand { kind = "shipAttack", text = targetShipName, target = targetId }, $"已向 {buildable.Name} 发射船首火炮齐射"));
             }
 
-            SpawnNativeButton(_nativeRow2, upgradeBtn, "返回我方船镇", () =>
+            SpawnNativeButton(_nativeRow3, upgradeBtn, "返回我方船镇", () =>
             {
                 var p = myHeart != null ? myHeart.transform.position : Vector3.zero;
                 FocusCameraOn(p.x, p.z);
+                if (myHeart != null) SelectBuildableInGame(myHeart);
             });
             return;
         }
@@ -207,10 +240,23 @@ internal sealed class FleetHud : MonoBehaviour
             var localName = myCommunity?.Name ?? "";
             var otherShips = net.Ships.Where(s => s != null && !string.IsNullOrEmpty(s.name) && s.name != localName).ToArray();
             var myPos = myHeart != null ? myHeart.transform.position : Vector3.zero;
+            var sliderMax = Mathf.Max(20, myStock);
+
+            // Row 1: Category selector + Continuous Slider + Arbitrary Integer Input + Max button
+            SpawnNativeButton(_nativeRow1, upgradeBtn, $"品类: {cat.Label} (库存 {myStock})", () =>
+            {
+                _selectedCategoryIdx = (_selectedCategoryIdx + 1) % TradeCategories.Length;
+                PopulateNativeBuildablePanel(panel);
+            });
+            SpawnAmountSliderAndInput(_nativeRow1, upgradeBtn, sliderMax);
 
             if (otherShips.Length > 0)
             {
-                _nativeTitle.text = $"⚓ 海上舰队指挥台 ({otherShips.Length + 1} 艘船在线 · 点击目标船建筑可直接操作)";
+                void UpdateFleetHeader(int curAmt) =>
+                    _nativeTitle!.text = $"海上舰队指挥台 ({otherShips.Length + 1} 艘船在线 · 当前选定: {cat.Label} ×{curAmt})";
+                UpdateFleetHeader(_selectedAmount);
+                _amountListeners.Add(UpdateFleetHeader);
+
                 foreach (var ship in otherShips.Take(2))
                 {
                     var dx = ship.x - myPos.x;
@@ -220,29 +266,43 @@ internal sealed class FleetHud : MonoBehaviour
                     var targetShip = ship.name;
                     var label = ship.ownerName;
 
-                    SpawnNativeButton(_nativeRow1, upgradeBtn, $"切至: {label} ({dir}{dist}m)", () => FocusCameraOn(ship.x, ship.z));
+                    SpawnNativeButton(_nativeRow2, upgradeBtn, $"切至: {label} ({dir}{dist}m)", () => FocusCameraOn(ship.x, ship.z));
                     if (rules.trading)
-                        SpawnNativeButton(_nativeRow1, upgradeBtn, $"送木→{label}", () =>
-                            net.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = targetShip, properties = "Wood", amount = 5 }, $"已向 {label} 派出木材运输船"));
+                        SpawnDynamicAmountButton(_nativeRow2, upgradeBtn,
+                            n => $"运送{cat.Label}×{n}→{label}",
+                            () => net.ExecuteOrSubmit(
+                                new GameCommand { kind = "shipTransfer", text = targetShip, properties = cat.Key, amount = _selectedAmount },
+                                $"已向 {label} 派出商船 ({cat.Label} ×{_selectedAmount})"));
                     if (rules.stealing)
-                        SpawnNativeButton(_nativeRow2, upgradeBtn, $"派艇掠夺→{label}", () =>
-                            net.ExecuteOrSubmit(new GameCommand { kind = "shipSteal", text = targetShip, amount = 3 }, $"已向 {label} 派出登船掠夺快艇"));
+                        SpawnDynamicAmountButton(_nativeRow3, upgradeBtn,
+                            n => $"劫掠{cat.Label}×{n}→{label}",
+                            () => net.ExecuteOrSubmit(
+                                new GameCommand { kind = "shipSteal", text = targetShip, properties = cat.Key, amount = _selectedAmount },
+                                $"已向 {label} 派出登船掠夺快艇 ({cat.Label} ×{_selectedAmount})"));
                     if (rules.friendlyFire)
-                        SpawnNativeButton(_nativeRow2, upgradeBtn, $"火炮齐射→{label}", () =>
-                            net.ExecuteOrSubmit(new GameCommand { kind = "shipAttack", text = targetShip }, $"已向 {label} 发射 3 发重炮齐射！"));
+                        SpawnNativeButton(_nativeRow3, upgradeBtn, $"火炮齐射→{label}", () =>
+                            net.ExecuteOrSubmit(new GameCommand { kind = "shipAttack", text = targetShip }, $"已向 {label} 发射 3 发重炮齐射"));
                 }
             }
             else
             {
-                _nativeTitle.text = "⚓ 舰队指挥台 (好友加入后点击对方建筑即可交互 · 下方可在海面实景演练)";
-                SpawnNativeButton(_nativeRow1, upgradeBtn, "遣船运木 (实景)", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = "__practice__", properties = "Wood", amount = 5 }, "已派出 3D 贸易运输船驶向海面靶船"));
-                SpawnNativeButton(_nativeRow1, upgradeBtn, "遣船运食 (实景)", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipTransfer", text = "__practice__", properties = "Food", amount = 3 }, "已派出 3D 补给运输船驶向海面靶船"));
-                SpawnNativeButton(_nativeRow2, upgradeBtn, "派艇登船掠夺 (实景)", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipSteal", text = "__practice__", amount = 3 }, "已派出 3D 劫掠快艇前往靶船搜刮物资"));
-                SpawnNativeButton(_nativeRow2, upgradeBtn, "船首火炮齐射 (实景)", () =>
-                    net.ExecuteOrSubmit(new GameCommand { kind = "shipAttack", text = "__practice__" }, "已向海面靶船发射 3 发抛物线火炮齐射！"));
+                void UpdatePracticeHeader(int curAmt) =>
+                    _nativeTitle!.text = $"舰队指挥台 (好友加入后点击对方建筑即可交互 · 当前已选: {cat.Label} ×{curAmt})";
+                UpdatePracticeHeader(_selectedAmount);
+                _amountListeners.Add(UpdatePracticeHeader);
+
+                SpawnDynamicAmountButton(_nativeRow2, upgradeBtn,
+                    n => $"遣船运{cat.Label}×{n} (演练)",
+                    () => net.ExecuteOrSubmit(
+                        new GameCommand { kind = "shipTransfer", text = "__practice__", properties = cat.Key, amount = _selectedAmount },
+                        $"已派出 3D 商船运送 {cat.Label} ×{_selectedAmount} 驶向靶船"));
+                SpawnDynamicAmountButton(_nativeRow2, upgradeBtn,
+                    n => $"派艇抢{cat.Label}×{n} (演练)",
+                    () => net.ExecuteOrSubmit(
+                        new GameCommand { kind = "shipSteal", text = "__practice__", properties = cat.Key, amount = _selectedAmount },
+                        $"已派出 3D 劫掠快艇前往靶船搜刮 {cat.Label} ×{_selectedAmount}"));
+                SpawnNativeButton(_nativeRow2, upgradeBtn, "船首火炮齐射 (演练)", () =>
+                    net.ExecuteOrSubmit(new GameCommand { kind = "shipAttack", text = "__practice__" }, "已向海面靶船发射 3 发抛物线火炮齐射"));
             }
             return;
         }
@@ -252,13 +312,14 @@ internal sealed class FleetHud : MonoBehaviour
             var crew = net.Crew.Where(c => c != null && c.id != net.Captain).ToArray();
             if (crew.Length == 0)
             {
-                _nativeTitle.text = "⚓ 同船共建指挥台 (等待更多船员加入 · 按 M 打开海图掌舵航行)";
+                _nativeTitle.text = "同船共建指挥台 (等待更多船员加入 · 按 M 打开海图掌舵航行)";
                 _nativeRow1.gameObject.SetActive(false);
                 _nativeRow2.gameObject.SetActive(false);
+                _nativeRow3.gameObject.SetActive(false);
             }
             else
             {
-                _nativeTitle.text = $"⚓ 同船共建指挥台 · 在线船员 ({net.Crew.Length}人)";
+                _nativeTitle.text = $"同船共建指挥台 · 在线船员 ({net.Crew.Length}人)";
                 foreach (var member in crew.Take(3))
                 {
                     var peerId = member.id;
@@ -329,6 +390,7 @@ internal sealed class FleetHud : MonoBehaviour
 
         _nativeRow1 = CreateNativeRow(_nativeDrawer.transform, "NativeActionRow1");
         _nativeRow2 = CreateNativeRow(_nativeDrawer.transform, "NativeActionRow2");
+        _nativeRow3 = CreateNativeRow(_nativeDrawer.transform, "NativeActionRow3");
     }
 
     private static RectTransform CreateNativeRow(Transform parent, string name)
@@ -346,14 +408,171 @@ internal sealed class FleetHud : MonoBehaviour
 
     private static void ClearNativeButtons()
     {
-        foreach (var b in _nativeButtons)
-            if (b != null) UnityEngine.Object.Destroy(b.gameObject);
-        _nativeButtons.Clear();
+        foreach (var node in _nativeNodes)
+            if (node != null) UnityEngine.Object.Destroy(node);
+        _nativeNodes.Clear();
+        _amountListeners.Clear();
         if (_nativeRow1 != null) _nativeRow1.gameObject.SetActive(false);
         if (_nativeRow2 != null) _nativeRow2.gameObject.SetActive(false);
+        if (_nativeRow3 != null) _nativeRow3.gameObject.SetActive(false);
     }
 
-    private static void SpawnNativeButton(RectTransform row, Button templateBtn, string label, Action onClick)
+    private static void NotifyAmountChanged(int nextAmount)
+    {
+        _selectedAmount = Mathf.Clamp(nextAmount, 1, 9999);
+        foreach (var listener in _amountListeners.ToArray())
+        {
+            try { listener(_selectedAmount); } catch { }
+        }
+    }
+
+    private static void SpawnAmountSliderAndInput(RectTransform row, Button templateBtn, int maxStock)
+    {
+        EnsureAssets();
+        row.gameObject.SetActive(true);
+
+        var container = new GameObject("AmountSliderBox", typeof(RectTransform), typeof(HorizontalLayoutGroup), typeof(LayoutElement));
+        container.transform.SetParent(row, false);
+        var hl = container.GetComponent<HorizontalLayoutGroup>();
+        hl.spacing = 6f;
+        hl.childAlignment = TextAnchor.MiddleCenter;
+        hl.childControlWidth = true;
+        hl.childControlHeight = true;
+        hl.childForceExpandWidth = false;
+        hl.childForceExpandHeight = false;
+
+        var boxLe = container.GetComponent<LayoutElement>();
+        boxLe.flexibleWidth = 1.6f;
+        boxLe.preferredHeight = 32f;
+
+        // 1. Continuous Integer Slider (1 .. max(20, maxStock, _selectedAmount))
+        var sliderGo = new GameObject("QuantitySlider", typeof(RectTransform), typeof(Slider), typeof(LayoutElement));
+        sliderGo.transform.SetParent(container.transform, false);
+        var sliderLe = sliderGo.GetComponent<LayoutElement>();
+        sliderLe.flexibleWidth = 1f;
+        sliderLe.minWidth = 96f;
+        sliderLe.preferredHeight = 22f;
+
+        var bgGo = CreatePanel("TrackBg", sliderGo.transform, _pillSprite!);
+        bgGo.GetComponent<Image>().color = new Color(0.18f, 0.12f, 0.08f, 0.90f);
+        var bgRt = bgGo.GetComponent<RectTransform>();
+        bgRt.anchorMin = new Vector2(0f, 0.25f);
+        bgRt.anchorMax = new Vector2(1f, 0.75f);
+        bgRt.offsetMin = Vector2.zero;
+        bgRt.offsetMax = Vector2.zero;
+
+        var fillArea = new GameObject("FillArea", typeof(RectTransform));
+        fillArea.transform.SetParent(sliderGo.transform, false);
+        var fillAreaRt = fillArea.GetComponent<RectTransform>();
+        fillAreaRt.anchorMin = new Vector2(0f, 0.25f);
+        fillAreaRt.anchorMax = new Vector2(1f, 0.75f);
+        fillAreaRt.offsetMin = new Vector2(4f, 0f);
+        fillAreaRt.offsetMax = new Vector2(-4f, 0f);
+
+        var fillGo = CreatePanel("Fill", fillArea.transform, _pillSprite!);
+        fillGo.GetComponent<Image>().color = ColGold;
+        var fillRt = fillGo.GetComponent<RectTransform>();
+        fillRt.offsetMin = Vector2.zero;
+        fillRt.offsetMax = Vector2.zero;
+
+        var handleArea = new GameObject("HandleArea", typeof(RectTransform));
+        handleArea.transform.SetParent(sliderGo.transform, false);
+        var handleAreaRt = handleArea.GetComponent<RectTransform>();
+        handleAreaRt.anchorMin = Vector2.zero;
+        handleAreaRt.anchorMax = Vector2.one;
+        handleAreaRt.offsetMin = new Vector2(6f, 0f);
+        handleAreaRt.offsetMax = new Vector2(-6f, 0f);
+
+        var handleGo = CreatePanel("Handle", handleArea.transform, _dotSprite!);
+        handleGo.GetComponent<Image>().color = ColCream;
+        var handleRt = handleGo.GetComponent<RectTransform>();
+        handleRt.sizeDelta = new Vector2(16f, 16f);
+
+        var slider = sliderGo.GetComponent<Slider>();
+        slider.fillRect = fillRt;
+        slider.handleRect = handleRt;
+        slider.targetGraphic = handleGo.GetComponent<Image>();
+        slider.direction = Slider.Direction.LeftToRight;
+        slider.wholeNumbers = true;
+        slider.minValue = 1f;
+        slider.maxValue = Mathf.Max(20, Mathf.Max(maxStock, _selectedAmount));
+        slider.SetValueWithoutNotify(_selectedAmount);
+
+        // 2. Direct Arbitrary Integer InputField (1 .. 9999)
+        var inputGo = CreatePanel("QuantityInput", container.transform, _pillSprite!);
+        inputGo.GetComponent<Image>().color = new Color(0.14f, 0.10f, 0.07f, 0.94f);
+        var inputLe = inputGo.AddComponent<LayoutElement>();
+        inputLe.preferredWidth = 54f;
+        inputLe.minWidth = 50f;
+        inputLe.preferredHeight = 28f;
+
+        var inputText = CreateText(inputGo.transform, _selectedAmount.ToString(), 13, FontStyle.Bold, ColCream, TextAnchor.MiddleCenter);
+        var textRt = inputText.GetComponent<RectTransform>();
+        textRt.anchorMin = Vector2.zero;
+        textRt.anchorMax = Vector2.one;
+        textRt.offsetMin = new Vector2(4f, 2f);
+        textRt.offsetMax = new Vector2(-4f, -2f);
+
+        var inputField = inputGo.AddComponent<InputField>();
+        inputField.textComponent = inputText;
+        inputField.contentType = InputField.ContentType.IntegerNumber;
+        inputField.characterLimit = 4;
+        inputField.SetTextWithoutNotify(_selectedAmount.ToString());
+
+        var suppressSync = false;
+        slider.onValueChanged.AddListener(v =>
+        {
+            if (suppressSync) return;
+            suppressSync = true;
+            var val = Mathf.Clamp(Mathf.RoundToInt(v), 1, 9999);
+            inputField.SetTextWithoutNotify(val.ToString());
+            NotifyAmountChanged(val);
+            suppressSync = false;
+        });
+
+        inputField.onValueChanged.AddListener(raw =>
+        {
+            if (suppressSync) return;
+            if (!int.TryParse(raw, out var parsed) || parsed < 1) return;
+            suppressSync = true;
+            var val = Mathf.Clamp(parsed, 1, 9999);
+            if (val > slider.maxValue) slider.maxValue = val;
+            slider.SetValueWithoutNotify(val);
+            NotifyAmountChanged(val);
+            suppressSync = false;
+        });
+
+        inputField.onEndEdit.AddListener(raw =>
+        {
+            if (!int.TryParse(raw, out var parsed) || parsed < 1)
+                inputField.SetTextWithoutNotify(_selectedAmount.ToString());
+        });
+
+        // 3. One-click "全部" (Max stock) button
+        SpawnNativeButton(container.GetComponent<RectTransform>(), templateBtn, "全部", () =>
+        {
+            var targetMax = Mathf.Clamp(maxStock > 0 ? maxStock : 20, 1, 9999);
+            suppressSync = true;
+            if (targetMax > slider.maxValue) slider.maxValue = targetMax;
+            slider.SetValueWithoutNotify(targetMax);
+            inputField.SetTextWithoutNotify(targetMax.ToString());
+            NotifyAmountChanged(targetMax);
+            suppressSync = false;
+        }, preferredWidth: 52f);
+
+        _nativeNodes.Add(container);
+    }
+
+    private static Button SpawnDynamicAmountButton(RectTransform row, Button templateBtn, Func<int, string> labelFormatter, Action onClick)
+    {
+        var btn = SpawnNativeButton(row, templateBtn, labelFormatter(_selectedAmount), onClick);
+        var tmp = btn.GetComponentInChildren<TextMeshProUGUI>(true);
+        if (tmp != null)
+            _amountListeners.Add(amt => { if (tmp != null) tmp.text = labelFormatter(amt); });
+        return btn;
+    }
+
+    private static Button SpawnNativeButton(RectTransform row, Button templateBtn, string label, Action onClick, float preferredWidth = -1f)
     {
         row.gameObject.SetActive(true);
         var cloneGo = UnityEngine.Object.Instantiate(templateBtn.gameObject, row, false);
@@ -390,11 +609,21 @@ internal sealed class FleetHud : MonoBehaviour
         }
 
         var le = cloneGo.GetComponent<LayoutElement>() ?? cloneGo.AddComponent<LayoutElement>();
-        le.flexibleWidth = 1f;
+        if (preferredWidth > 0f)
+        {
+            le.flexibleWidth = 0f;
+            le.preferredWidth = preferredWidth;
+            le.minWidth = preferredWidth;
+        }
+        else
+        {
+            le.flexibleWidth = 1f;
+        }
         le.preferredHeight = 32f;
         le.minHeight = 30f;
 
-        _nativeButtons.Add(btn);
+        _nativeNodes.Add(cloneGo);
+        return btn;
     }
 
     private static string ResolveOwnerLabel(string? communityName)
@@ -416,6 +645,21 @@ internal sealed class FleetHud : MonoBehaviour
             if (cam == null) return;
             var pos = cam.transform.position;
             cam.transform.position = new Vector3(x, pos.y, z);
+        }
+        catch { }
+    }
+
+    internal static void SelectBuildableInGame(Buildable buildable)
+    {
+        try
+        {
+            var panel = Resources.FindObjectsOfTypeAll<BuildablePanel>().FirstOrDefault(p => p != null && p.gameObject.scene.IsValid());
+            if (panel != null)
+            {
+                panel.gameObject.SetActive(true);
+                AccessTools.DeclaredMethod(typeof(BuildablePanel), "Initialize", new[] { typeof(Buildable), typeof(bool) })
+                    ?.Invoke(panel, new object[] { buildable, true });
+            }
         }
         catch { }
     }
