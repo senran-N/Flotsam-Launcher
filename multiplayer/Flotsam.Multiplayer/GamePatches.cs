@@ -69,9 +69,10 @@ internal static class GamePatches
     }
     private static bool Simulate()=>!Client;
     private static bool CanSave()=>Network?.IsClient!=true;
-    private static bool PlaceBoat(BoatCursorProperties __instance,MooringPoint mooringPoint)
+    private static bool PlaceBoat(BoatCursorProperties __instance,object[] __args)
     {
         if(!Client)return true;
+        var mooringPoint=__args.Length>0?__args[0] as MooringPoint:null;
         var boat=(Boat)AccessTools.Field(typeof(BoatCursorProperties),"_boat").GetValue(__instance);
         var visual=(int)AccessTools.Field(typeof(BuildableCursorProperties),"_visualIndex").GetValue(__instance);
         if(boat?.Buildable?.Properties!=null&&mooringPoint?.Buildable!=null)
@@ -81,22 +82,25 @@ internal static class GamePatches
         }
         return false;
     }
-    private static bool ConnectEnergy(EnergyGridConnectCursorProperties __instance,EnergyGridConnector other,CursorManager cursor)
+    private static bool ConnectEnergy(EnergyGridConnectCursorProperties __instance,object[] __args)
     {
         if(!Client)return true;
+        var other=__args.Length>0?__args[0] as EnergyGridConnector:null;
+        var cursor=__args.Length>1?__args[1] as CursorManager:null;
         var src=AccessTools.Field(typeof(EnergyGridConnectCursorProperties),"_component").GetValue(__instance) as EnergyGridBuildableComponent;
         var withIndex=(bool)AccessTools.Field(typeof(EnergyGridConnectCursorProperties),"_connectWithIndex").GetValue(__instance);
         var idx=(uint)AccessTools.Field(typeof(EnergyGridConnectCursorProperties),"_componentConnectIndex").GetValue(__instance);
         if(src?.Buildable!=null&&other is EnergyGridBuildableComponent dst&&dst.Buildable!=null)
         {
             Network!.Submit(new GameCommand{kind="energyConnect",target=Network.Id(src.Buildable),reference=Network.Id(dst.Buildable),value=withIndex?(int)idx:-1});
-            cursor.Deactivate();
+            cursor?.Deactivate();
         }
         return false;
     }
-    private static bool DisconnectEnergy(EnergyGridBuildableComponent __instance,EnergyGridConnector other)
+    private static bool DisconnectEnergy(EnergyGridBuildableComponent __instance,object[] __args)
     {
         if(!Client)return true;
+        var other=__args.Length>0?__args[0] as EnergyGridConnector:null;
         if(__instance?.Buildable!=null&&other is EnergyGridBuildableComponent dst&&dst.Buildable!=null)
             Network!.Submit(new GameCommand{kind="energyDisconnect",target=Network.Id(__instance.Buildable),reference=Network.Id(dst.Buildable)});
         return false;
