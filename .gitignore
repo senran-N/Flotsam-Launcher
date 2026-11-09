@@ -1,0 +1,33 @@
+# Local internal documentation & AI instructions (never pushed)
+.doc/
+AGENTS.md
+
+# Frontend & Node
+node_modules/
+dist/
+test-results/
+playwright-report/
+
+# Tauri & Rust
+src-tauri/target/
+src-tauri/gen/
+*.WebView2/
+
+# C# build outputs, downloaded vendor archives & local sandboxes
+multiplayer/vendor/
+multiplayer/payload/
+multiplayer/lab/
+**/bin/
+**/obj/
+
+# Packaged executables & runtime diagnostics
+release/
+浮游启动器.exe
+diagnostics.json
+*.log
+
+# IDE & temporary workspaces
+.work/
+.taste-skill/
+.vscode/
+.idea/

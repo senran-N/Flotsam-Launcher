@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>netstandard2.1</TargetFramework><LangVersion>latest</LangVersion><GenerateAssemblyInfo>false</GenerateAssemblyInfo></PropertyGroup>
+  <ItemGroup><Reference Include="BepInEx"><HintPath>../vendor/BepInEx-5.4.23.6/BepInEx/core/BepInEx.dll</HintPath><Private>false</Private></Reference><Reference Include="UnityEngine.CoreModule"><HintPath>D:/Epic Games/Flotsam/Flotsam_Data/Managed/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference><Reference Include="UnityEngine"><HintPath>D:/Epic Games/Flotsam/Flotsam_Data/Managed/UnityEngine.dll</HintPath><Private>false</Private></Reference></ItemGroup>
+</Project>

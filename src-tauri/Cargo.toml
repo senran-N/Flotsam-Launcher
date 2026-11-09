@@ -1,0 +1,30 @@
+[package]
+name = "flotsam-launcher"
+version = "0.5.0"
+description = "Independent Flotsam game and mod launcher"
+edition = "2021"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt-multi-thread", "macros"] }
+sha2 = "0.10"
+hmac = "0.12"
+getrandom = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
+dotnetdll = "=0.3.1"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 8
