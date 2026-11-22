@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace Flotsam.Multiplayer;
 
-[BepInPlugin("local.flotsam.multiplayer", "Flotsam Multiplayer", "0.0.1")]
+[BepInPlugin("local.flotsam.multiplayer", "Flotsam Multiplayer", "0.0.2")]
 public sealed class Plugin : BaseUnityPlugin
 {
     internal static Plugin? Instance;

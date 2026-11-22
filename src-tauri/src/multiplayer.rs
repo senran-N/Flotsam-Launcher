@@ -98,7 +98,7 @@ pub fn multiplayer_status(app: tauri::AppHandle) -> Result<MultiplayerStatus> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     Ok(MultiplayerStatus {
         installed: installed(&root),
-        version: "0.0.1-pre",
+        version: "0.0.2-pre",
         runtime,
     })
 }

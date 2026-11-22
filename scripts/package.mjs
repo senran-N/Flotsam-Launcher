@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = new URL('../', import.meta.url);
 const pkg = JSON.parse(await readFile(new URL('package.json', root), 'utf8'));
-const version = pkg.version || '0.0.1-pre';
+const version = pkg.version || '0.0.2-pre';
 
 const releaseDir = new URL('release/', root);
 await mkdir(releaseDir, { recursive: true });

@@ -7,7 +7,7 @@ export type Locale = 'zh' | 'en';
 const zh = {
   'app.name': '浮游',
   'app.tagline': '让生活，随海漂流。',
-  'app.version': '浮游 · 0.0.1-pre',
+  'app.version': '浮游 · 0.0.2-pre',
   'app.desktop': '本地桌面版',
   'app.preview': '浏览器预览',
   'app.independent': '独立社区启动器',
@@ -415,7 +415,7 @@ const zh = {
 const en: Record<keyof typeof zh, string> = {
   'app.name': 'Flotsam',
   'app.tagline': 'Let life drift with the sea.',
-  'app.version': 'Flotsam · 0.0.1-pre',
+  'app.version': 'Flotsam · 0.0.2-pre',
   'app.desktop': 'Desktop build',
   'app.preview': 'Browser preview',
   'app.independent': 'Independent community launcher',

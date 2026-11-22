@@ -1253,7 +1253,7 @@ pub async fn open_mod_file(
     .map_err(err)?
 }
 
-pub const LAUNCHER_VERSION: &str = "0.0.1-pre";
+pub const LAUNCHER_VERSION: &str = "0.0.2-pre";
 pub const GITHUB_REPO: &str = "senran-N/Flotsam-Launcher";
 pub const GITHUB_RELEASES_URL: &str = "https://github.com/senran-N/Flotsam-Launcher/releases";
 
