@@ -43,14 +43,16 @@ internal static class ConstructionCommands
         var seed=Get<Vector2>(cursor,"_startPosition");
         var input=CursorManager.BuildingPosition;
         if(!Replication.Finite(seed.x)||!Replication.Finite(seed.y)||!Replication.Finite(input.x)||!Replication.Finite(input.z))return Reject(network,"道路坐标无效");
-        network.Submit(new GameCommand{kind=PlaceRoad,properties=prefab.Properties.name,target=target,reference=reference,text=seed.x.ToString("R",CultureInfo.InvariantCulture)+";"+seed.y.ToString("R",CultureInfo.InvariantCulture),x=input.x,z=input.z,visual=end.VisualIndex,value=Settings.Instance.GameplayPlayerData.SnapBuilding?1:0});
+        var hostSeed=ClientOceanAnchor.ClientToHostPos(new Vector3(seed.x,0f,seed.y));
+        var hostInput=ClientOceanAnchor.ClientToHostPos(input);
+        if(!network.Submit(new GameCommand{kind=PlaceRoad,properties=prefab.Properties.name,target=target,reference=reference,text=hostSeed.x.ToString("R",CultureInfo.InvariantCulture)+";"+hostSeed.z.ToString("R",CultureInfo.InvariantCulture),x=hostInput.x,z=hostInput.z,visual=end.VisualIndex,value=Settings.Instance.GameplayPlayerData.SnapBuilding?1:0}))return false;
         // No local PlaceLine, ponton, inventory or predicted neighbour graph. Reset to the first
         // native preview; continuous extension must wait for the authoritative endpoint frame.
         Method("CancelIteration",Type.EmptyTypes).Invoke(cursor,Array.Empty<object>());
         return true;
     }
 
-    private static bool Reject(GameSession network,string error){network.LastResult=new CommandResult{accepted=false,error=error};return false;}
+    private static bool Reject(GameSession network,string error){network.ShowNotice(error,true);return false;}
 
     internal static string? Execute(GameCommand command,IReadOnlyDictionary<string,BuildableProperties> properties,IReadOnlyDictionary<long,Buildable> buildings,Community? owner=null)
     {

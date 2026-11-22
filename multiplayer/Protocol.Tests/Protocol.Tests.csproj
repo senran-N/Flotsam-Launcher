@@ -1,10 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net9.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
   <ItemGroup>
+    <Compile Include="../Flotsam.Multiplayer/DiplomacyRequests.cs" Link="DiplomacyRequests.cs"/>
+    <Compile Include="../Flotsam.Multiplayer/Ballistics.cs" Link="Ballistics.cs"/>
+    <Compile Include="../Flotsam.Multiplayer/PlayerIdentity.cs" Link="PlayerIdentity.cs"/>
     <Compile Include="../Flotsam.Multiplayer/Protocol.cs" Link="Protocol.cs"/>
+    <Compile Include="../Flotsam.Multiplayer/WorldDeltas.cs" Link="WorldDeltas.cs"/>
+    <Compile Include="../Flotsam.Multiplayer/BootstrapTransfer.cs" Link="BootstrapTransfer.cs"/>
     <Compile Include="../Flotsam.Multiplayer/CrewPolicy.cs" Link="CrewPolicy.cs"/>
     <Compile Include="../Flotsam.Multiplayer/JsonCodec.cs" Link="JsonCodec.cs"/>
     <Compile Include="../Flotsam.Multiplayer/NetConfig.cs" Link="NetConfig.cs"/>
     <Compile Include="../Flotsam.Multiplayer/SnapshotGuard.cs" Link="SnapshotGuard.cs"/>
+    <Compile Include="../Flotsam.Multiplayer/PoseInterpolation.cs" Link="PoseInterpolation.cs"/>
+    <Compile Include="../Flotsam.Multiplayer/OceanAnchorMath.cs" Link="OceanAnchorMath.cs"/>
+    <Compile Include="../Flotsam.Multiplayer/FleetMechanicsMath.cs" Link="FleetMechanicsMath.cs"/>
   </ItemGroup>
 </Project>

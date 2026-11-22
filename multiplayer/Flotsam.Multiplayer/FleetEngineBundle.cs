@@ -87,6 +87,7 @@ public static class FleetEngineBundle
     public static void RegisterShip(Community community, string id, Engine engine, Construction root)
     {
         EnsurePrimary();
+        id=FleetOwnership.Owner(community,id);
         Owners[community] = new Owner(community, id, engine, root);
     }
 
@@ -107,9 +108,14 @@ public static class FleetEngineBundle
         Owners.Remove(local);
         var heart = local.Buildables.FirstOrDefault(b => b != null && b.GetComponent<Engine>() != null && b.GetComponent<Construction>() != null);
         if (heart == null) return;
-        Owners[local] = new Owner(local, "local", heart.GetComponent<Engine>()!, heart.GetComponent<Construction>()!);
+        var localEngine = heart.GetComponent<Engine>()!;
+        var localRoot = heart.GetComponent<Construction>()!;
+        Owners[local] = new Owner(local, "local", localEngine, localRoot);
+        HeartEngine.SetValue(null, localEngine);
+        typeof(Community).GetProperty("Engine", Flags)?.GetSetMethod(true)?.Invoke(local, new object[] { localEngine });
         if (old != null && previousPrimary != null)
             Owners[previousPrimary] = new Owner(previousPrimary, previousId, old.Heart, old.Root);
+        Refresh(Owners[local]);
     }
 
     public static bool IsSecondary(Community? community) => community != null && Owners.TryGetValue(community, out var owner) && !owner.Primary;
@@ -127,8 +133,28 @@ public static class FleetEngineBundle
 
     public static float EnergyOf(Community community)
     {
+        EnsurePrimary();
         if (!Owners.TryGetValue(community, out var owner) || owner.Heart?.EnergyGrid == null) return 0f;
         return owner.Heart.EnergyGrid.ReturnStorageEnergy();
+    }
+
+    public static void SyncEnergy(Community? community, float targetEnergy)
+    {
+        if (community == null || !float.IsFinite(targetEnergy)) return;
+        EnsurePrimary();
+        if (!Owners.TryGetValue(community, out var owner) || owner.Heart?.EnergyGrid?.Storages == null) return;
+        var storages = owner.Heart.EnergyGrid.Storages;
+        var current = owner.Heart.EnergyGrid.ReturnStorageEnergy();
+        if (Mathf.Abs(current - targetEnergy) < 0.2f) return;
+        var remaining = Mathf.Max(0f, targetEnergy);
+        for (var i = 0; i < storages.Count; i++)
+        {
+            var storage = storages[i];
+            if (storage == null) continue;
+            var toSet = Mathf.Min(remaining, storage.EnergyCapacity);
+            storage.SetEnergyAmount(toSet);
+            remaining -= toSet;
+        }
     }
 
     public static void ConsumeEnergy(Community community, float distance)

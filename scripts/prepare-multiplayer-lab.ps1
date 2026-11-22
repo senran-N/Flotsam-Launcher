@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Source = 'D:\Epic Games\Flotsam',
     [string]$Lab = 'D:\Epic Games\Flotsam Launcher\multiplayer\lab',
     [ValidateSet('shared', 'independent')][string]$Mode = 'independent',
@@ -25,6 +25,11 @@ foreach ($instance in @('host', 'client')) {
     New-Item -ItemType Directory -Path $plugins -Force | Out-Null
     Copy-Item -LiteralPath $plugin -Destination $plugins -Force
     $profile = Join-Path $target 'multiplayer-profile'
+    New-Item -ItemType Directory -Path $profile -Force | Out-Null
+    $userSettings = Join-Path $env:USERPROFILE 'AppData\LocalLow\Pajama Llama Games\Flotsam\PlayerSettings.json'
+    if (Test-Path -LiteralPath $userSettings) {
+        Copy-Item -LiteralPath $userSettings -Destination (Join-Path $profile 'PlayerSettings.json') -Force
+    }
     $cfgPath = Join-Path $target 'network.json'
     @{
         role = $instance
@@ -36,6 +41,12 @@ foreach ($instance in @('host', 'client')) {
         windowed = $true
         mode = $Mode
         nickname = if ($instance -eq 'host') { '房主' } else { '同行者' }
+        rules = @{
+            trading = $true
+            stealing = $true
+            sabotage = $true
+            friendlyFire = $true
+        }
     } | ConvertTo-Json | Set-Content -LiteralPath $cfgPath -Encoding utf8NoBOM
     if ($Launch) {
         Start-Process -FilePath (Join-Path $target 'Flotsam.exe') -WorkingDirectory $target -Environment @{ FLOTSAM_MULTIPLAYER_CONFIG = $cfgPath }

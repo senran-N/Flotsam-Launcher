@@ -3,6 +3,7 @@ using System;
 using Debris=Game::Flotsam;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
 
@@ -10,13 +11,18 @@ namespace Flotsam.Multiplayer;
 
 internal sealed class SalvageReplication
 {
+    private static readonly FieldInfo? CompositionField=AccessTools.Field(typeof(FlotsamInventory),"_composition");
+    private static readonly FieldInfo? MarkerPositionField=AccessTools.Field(typeof(Marker),"_position");
+    private static readonly FieldInfo? MarkerHighlighterField=AccessTools.Field(typeof(Marker),"_markerRangeHighlighter");
+    private static readonly MethodInfo? UpdateFlotsamInRadiusMethod=AccessTools.Method(typeof(Marker),"UpdateFlotsamInRadius");
     private readonly Dictionary<long,Debris> _flotsam=new Dictionary<long,Debris>();
-    private readonly Dictionary<long,(Vector3 pos,Quaternion rot)> _flotsamTargets=new Dictionary<long,(Vector3,Quaternion)>();
+    private readonly PoseTrackMap _flotsamTracks=new PoseTrackMap();
     private readonly Dictionary<long,Marker> _markers=new Dictionary<long,Marker>();
+    private readonly PoseTrackMap _markerTracks=new PoseTrackMap();
     private readonly Dictionary<string,MarkerCursorProperties> _cursors=new Dictionary<string,MarkerCursorProperties>(StringComparer.Ordinal);
     private readonly Dictionary<string,FlotsamProperties> _properties=new Dictionary<string,FlotsamProperties>(StringComparer.Ordinal);
     private readonly Dictionary<string,ItemProperties> _items=new Dictionary<string,ItemProperties>(StringComparer.Ordinal);
-    public void Reset(){_flotsam.Clear();_flotsamTargets.Clear();_markers.Clear();_cursors.Clear();_properties.Clear();_items.Clear();}
+    public void Reset(){_flotsam.Clear();_flotsamTracks.Clear();_markers.Clear();_markerTracks.Clear();_cursors.Clear();_properties.Clear();_items.Clear();}
     private void Catalog()
     {
         if(_cursors.Count!=0)return;
@@ -40,7 +46,7 @@ internal sealed class SalvageReplication
         frame.markers=Owners().SelectMany(owner=>owner.Community.Markers.Where(m=>m!=null).Select(m=>
         {
             var key=id(m);_markers[key]=m;var p=m.transform.position;
-            return new MarkerState{id=key,owner=owner.Community.Name??"",properties=m.MarkerCursorProperties.name,x=p.x,y=p.y,z=p.z,radius=m.CurrentRadiusIntervalIndex,limit=m.Project?.AssignmentLimit??1,disabled=m.ItemFilter.Where(e=>!e.Value).Select(e=>e.Key.name).OrderBy(s=>s,StringComparer.Ordinal).ToArray()};
+            return new MarkerState{id=key,owner=Replication.ShipKey(owner.Community),properties=m.MarkerCursorProperties.name,x=p.x,y=p.y,z=p.z,rotation=m.transform.eulerAngles.y,radius=m.CurrentRadiusIntervalIndex,limit=m.Project?.AssignmentLimit??1,disabled=m.ItemFilter.Where(e=>!e.Value).Select(e=>e.Key.name).OrderBy(s=>s,StringComparer.Ordinal).ToArray()};
         })).ToArray();
         var alive=new HashSet<long>(frame.flotsam.Select(f=>f.id));foreach(var key in _flotsam.Keys.ToArray())if(!alive.Contains(key))_flotsam.Remove(key);
         alive=new HashSet<long>(frame.markers.Select(m=>m.id));foreach(var key in _markers.Keys.ToArray())if(!alive.Contains(key))_markers.Remove(key);
@@ -52,11 +58,12 @@ internal sealed class SalvageReplication
         foreach(var state in frame.flotsam)
         {
             if(state.id<=0||!alive.Add(state.id)||!Replication.Finite(state.x)||!Replication.Finite(state.y)||!Replication.Finite(state.z)||!Replication.Finite(state.rotation)||state.items.Length>128)throw new InvalidOperationException("Invalid flotsam state");
+            ClientOceanAnchor.HostToClientPose(state.x,state.z,state.rotation,out var fx,out var fz,out var fyaw);
             if(!_properties.TryGetValue(state.properties,out var properties)||properties.FlotsamPrefab==null)throw new InvalidOperationException("Missing flotsam prefab");
-            if(_flotsam.TryGetValue(state.id,out var previous)&&previous!=null&&!previous.Pooled&&previous.Properties!=properties){previous.SafelyDestroy();_flotsam.Remove(state.id);}
+            if(_flotsam.TryGetValue(state.id,out var previous)&&previous!=null&&!previous.Pooled&&previous.Properties!=properties){previous.SafelyDestroy();_flotsam.Remove(state.id);_flotsamTracks.Remove(state.id);}
             if(!_flotsam.TryGetValue(state.id,out var f)||f==null||f.Pooled)
             {
-                f=GameManager.WorldManager.FlotsamInWorld.FirstOrDefault(local=>local!=null&&!used.Contains(local)&&local.Properties==properties&&(local.transform.position-new Vector3(state.x,state.y,state.z)).sqrMagnitude<4);
+                f=GameManager.WorldManager.FlotsamInWorld.FirstOrDefault(local=>local!=null&&!used.Contains(local)&&local.Properties==properties&&(local.transform.position-new Vector3(fx,state.y,fz)).sqrMagnitude<4);
                 if(f==null){f=UnityEngine.Object.Instantiate(properties.FlotsamPrefab);f.Initialize(properties,state.visual);var initial=new List<Item>();foreach(var e in state.items){if(e.count<1||e.count>1000||!_items.TryGetValue(e.properties,out var item))throw new InvalidOperationException("Invalid flotsam inventory");for(var i=0;i<e.count;i++)initial.Add(new Item(item));}f.InitializeComposition(new CompositionInventory(initial));}
                 _flotsam[state.id]=f;used.Add(f);bind(f,state.id);
             }
@@ -65,48 +72,88 @@ internal sealed class SalvageReplication
             {
                 var items=new List<Item>();
                 foreach(var entry in state.items){if(entry.count<1||entry.count>1000||!_items.TryGetValue(entry.properties,out var item))throw new InvalidOperationException("Invalid flotsam inventory");for(var i=0;i<entry.count;i++)items.Add(new Item(item));}
-                (AccessTools.Field(typeof(FlotsamInventory),"_composition").GetValue(f.Inventory) as CompositionInventory)?.Clear();
+                (CompositionField?.GetValue(f.Inventory) as CompositionInventory)?.Clear();
                 f.InitializeComposition(new CompositionInventory(items));
             }
-            var targetPos=new Vector3(state.x,state.y,state.z);var targetRot=Quaternion.Euler(0,state.rotation,0);
-            if(!_flotsamTargets.ContainsKey(state.id)||(f.transform.position-targetPos).sqrMagnitude>400f)f.UpdatePositionAndRotation(targetPos,targetRot);
-            _flotsamTargets[state.id]=(targetPos,targetRot);
-            f.StopAllCoroutines();
-            foreach(var body in f.GetComponentsInChildren<Rigidbody>())body.isKinematic=true;
+            ReplicaFreeze.FreezeFlotsam(f);
+            var targetFPose=new PoseSample(fx,state.y,fz,fyaw);
+            if(_flotsamTracks.UpdateTarget(state.id,ReplicaFreeze.CurrentPose(f.transform),targetFPose,400f))
+                f.UpdatePositionAndRotation(new Vector3(targetFPose.X,targetFPose.Y,targetFPose.Z),Quaternion.Euler(0f,targetFPose.Yaw,0f));
             if(f.VisualPrefab!=null)f.VisualPrefab.SetProgress(state.progress);
         }
-        foreach(var pair in _flotsam.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null&&!pair.Value.Pooled)pair.Value.SafelyDestroy();_flotsam.Remove(pair.Key);_flotsamTargets.Remove(pair.Key);}
+        foreach(var pair in _flotsam.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null&&!pair.Value.Pooled)pair.Value.SafelyDestroy();_flotsam.Remove(pair.Key);_flotsamTracks.Remove(pair.Key);}
         var authoritative=new HashSet<Debris>(_flotsam.Values);
         foreach(var local in GameManager.WorldManager.FlotsamInWorld.ToArray())if(local!=null&&!authoritative.Contains(local))local.SafelyDestroy();
         var markerUsed=new HashSet<Marker>(_markers.Values);alive.Clear();
         foreach(var state in frame.markers)
         {
-            if(state.id<=0||!alive.Add(state.id)||!_cursors.TryGetValue(state.properties,out var cursor)||state.radius<0||state.radius>=cursor.RadiusIntervalAmount||state.limit<1||state.limit>20||!Replication.Finite(state.x)||!Replication.Finite(state.z))throw new InvalidOperationException("Invalid salvage marker");
+            if(state.id<=0||!alive.Add(state.id)||!_cursors.TryGetValue(state.properties,out var cursor)||state.radius<0||state.radius>=cursor.RadiusIntervalAmount||state.limit<1||state.limit>20||!Replication.Finite(state.x)||!Replication.Finite(state.y)||!Replication.Finite(state.z)||!Replication.Finite(state.rotation))throw new InvalidOperationException("Invalid salvage marker");
+            ClientOceanAnchor.HostToClientPose(state.x,state.z,state.rotation,out var mx,out var mz,out var myaw);
             if(!_markers.TryGetValue(state.id,out var marker)||marker==null)
             {
-                var community=Replication.ResolveCommunity(state.owner)??Community.PlayerCommunity;
-                marker=community.Markers.FirstOrDefault(m=>m!=null&&!markerUsed.Contains(m)&&m.MarkerCursorProperties==cursor&&(m.transform.position-new Vector3(state.x,state.y,state.z)).sqrMagnitude<1);
-                if(marker==null){marker=UnityEngine.Object.Instantiate(cursor.MarkerPrefab,new Vector3(state.x,state.y,state.z),Quaternion.identity);marker.Restore(cursor,state.radius,null);marker.Community=community;community.Markers.Add(marker);}
+                var community=Replication.ResolveShipCommunity(state.owner)??Community.PlayerCommunity;
+                marker=community.Markers.FirstOrDefault(m=>m!=null&&!markerUsed.Contains(m)&&m.MarkerCursorProperties==cursor&&(m.transform.position-new Vector3(mx,state.y,mz)).sqrMagnitude<1);
+                if(marker==null){marker=UnityEngine.Object.Instantiate(cursor.MarkerPrefab,new Vector3(mx,state.y,mz),Quaternion.Euler(0f,myaw,0f));marker.Restore(cursor,state.radius,null);marker.Community=community;community.Markers.Add(marker);}
                 _markers[state.id]=marker;markerUsed.Add(marker);bind(marker,state.id);
                 if(marker.Project==null)marker.LinkProject(new Project(Project(cursor),marker.gameObject,marker));
             }
-            marker.transform.position=new Vector3(state.x,state.y,state.z);if(marker.CurrentRadiusIntervalIndex!=state.radius)marker.SetSizeIndex(state.radius);
+            ReplicaFreeze.FreezeMarker(marker);
+            var targetMPose=new PoseSample(mx,state.y,mz,myaw);
+            if(_markerTracks.UpdateTarget(state.id,ReplicaFreeze.CurrentPose(marker.transform),targetMPose,400f))
+                SyncMarkerPose(marker,targetMPose);
+            else
+                MarkerPositionField?.SetValue(marker,new Vector3(mx,state.y,mz));
+            if(marker.CurrentRadiusIntervalIndex!=state.radius)marker.SetSizeIndex(state.radius);
             marker.Project!.AssignmentLimit=state.limit;
             foreach(var key in marker.ItemFilter.Keys.ToArray())marker.ItemFilter[key]=!state.disabled.Contains(key.name);
-            marker.UpdatedAllowedItemPropertiesEvent.Invoke();AccessTools.Method(typeof(Marker),"UpdateFlotsamInRadius").Invoke(marker,null);
+            marker.UpdatedAllowedItemPropertiesEvent.Invoke();UpdateFlotsamInRadiusMethod?.Invoke(marker,null);
         }
-        foreach(var pair in _markers.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null){if(pair.Value.Project!=null)pair.Value.Project.Stop(ProjectFlags.Cancelled);else UnityEngine.Object.Destroy(pair.Value.gameObject);}_markers.Remove(pair.Key);}
+        foreach(var pair in _markers.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null){if(pair.Value.Project!=null)pair.Value.Project.Stop(ProjectFlags.Cancelled);else UnityEngine.Object.Destroy(pair.Value.gameObject);}_markers.Remove(pair.Key);_markerTracks.Remove(pair.Key);}
+    }
+    internal void ShiftRebased(Func<PoseSample,PoseSample> shift)
+    {
+        _flotsamTracks.ShiftAll(shift);
+        _markerTracks.ShiftAll(shift);
+        foreach(var f in _flotsam.Values)
+        {
+            if(f==null||f.Pooled)continue;
+            var p=shift(ReplicaFreeze.CurrentPose(f.transform));
+            f.UpdatePositionAndRotation(new Vector3(p.X,p.Y,p.Z),Quaternion.Euler(0f,p.Yaw,0f));
+        }
+        foreach(var m in _markers.Values)
+            if(m!=null)SyncMarkerPose(m,shift(ReplicaFreeze.CurrentPose(m.transform)));
+    }
+    private static void SyncMarkerPose(Marker marker,PoseSample pose)
+    {
+        var pos=new Vector3(pose.X,pose.Y,pose.Z);
+        marker.transform.SetPositionAndRotation(pos,Quaternion.Euler(0f,pose.Yaw,0f));
+        MarkerPositionField?.SetValue(marker,pos);
+        if(MarkerHighlighterField?.GetValue(marker) is CircleWaveHighlighter highlighter&&highlighter!=null)
+            highlighter.gameObject.transform.position=new Vector3(pos.x,0f,pos.z);
     }
     private static ProjectProperties Project(MarkerCursorProperties cursor)=>(ProjectProperties)AccessTools.Field(typeof(MarkerCursorProperties),"_projectProperties").GetValue(cursor);
-    public void Interpolate(float dt)
+    public void Interpolate(float alpha)
     {
-        var t=Mathf.Clamp01(dt*12f);
-        foreach(var pair in _flotsamTargets)
+        var waveTime=Time.unscaledTime;
+        foreach(var pair in _flotsam)
         {
-            if(!_flotsam.TryGetValue(pair.Key,out var f)||f==null||f.Pooled)continue;
-            var cur=f.transform.position;
-            if((cur-pair.Value.pos).sqrMagnitude>0.0001f||Quaternion.Angle(f.transform.rotation,pair.Value.rot)>0.1f)
-                f.UpdatePositionAndRotation(Vector3.Lerp(cur,pair.Value.pos,t),Quaternion.Slerp(f.transform.rotation,pair.Value.rot,t));
+            var f=pair.Value;
+            if(f==null||f.Pooled)continue;
+            if(_flotsamTracks.Sample(pair.Key,alpha,out var pose))
+            {
+                var cur=ReplicaFreeze.CurrentPose(f.transform);
+                if(cur.DistanceSq(pose)>0.000001f||cur.AngleDeltaAbs(pose)>0.05f)
+                    f.UpdatePositionAndRotation(new Vector3(pose.X,pose.Y,pose.Z),Quaternion.Euler(0f,pose.Yaw,0f));
+            }
+            ReplicaFreeze.ApplyFlotsamWaveBob(f,waveTime);
+        }
+        foreach(var pair in _markers)
+        {
+            var m=pair.Value;
+            if(m==null||!_markerTracks.Sample(pair.Key,alpha,out var pose))continue;
+            var cur=ReplicaFreeze.CurrentPose(m.transform);
+            if(cur.DistanceSq(pose)>0.000001f||cur.AngleDeltaAbs(pose)>0.05f)
+                SyncMarkerPose(m,pose);
         }
     }
     public string? Execute(GameCommand command,Community? actorCommunity=null)
@@ -127,7 +174,7 @@ internal sealed class SalvageReplication
             marker.Initialize(position,command.value,project,cursor);marker.Community=owner;owner.QueueProject(project);owner.Markers.Add(marker);return null;
         }
         if(!_markers.TryGetValue(command.target,out var target)||target==null)return "打捞标记已不存在";
-        if(target.Community!=null&&target.Community!=owner&&!Plugin.Options.rules.Allows(command.kind))return "房主未允许修改其他船只的打捞标记";
+        if(target.Community!=null&&target.Community!=owner)return "只能管理本船的打捞标记";
         switch(command.kind)
         {
             case "markerRemove":target.Remove();return null;

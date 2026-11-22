@@ -25,7 +25,7 @@ public static class FleetKinematics
         var oldRotation = heart.transform.rotation;
         var deltaRotation = newRotation * Quaternion.Inverse(oldRotation);
 
-        foreach (var transform in TopLevelTransforms(owner))
+        foreach (var transform in TopLevelTransforms(owner, includeAtSea: false))
         {
             var offset = transform.position - oldPose;
             transform.position = newPose + deltaRotation * offset;
@@ -38,31 +38,75 @@ public static class FleetKinematics
         if (distance > 0f) FleetEngineBundle.ConsumeEnergy(owner, distance);
     }
 
-    public static IEnumerable<Transform> TopLevelTransforms(Community owner)
+    /// <summary>
+    /// Enumerates top-level transforms belonging to <paramref name="owner"/>.
+    /// When <paramref name="includeAtSea"/> is false (ship hull propulsion), open-sea boats,
+    /// open-water swimmers, and off-board stored buildables are left at their ocean positions.
+    /// When <paramref name="includeAtSea"/> is true (world-origin anchor rebase), all owned scene
+    /// objects are rebased together so they remain stationary in canonical ocean coordinates.
+    /// </summary>
+    public static IEnumerable<Transform> TopLevelTransforms(Community owner, bool includeAtSea = false)
     {
-        var owned = new HashSet<Buildable>(owner.Buildables.Where(b => b != null));
-        foreach (var building in owned)
+        var movingBuildings = new HashSet<Buildable>();
+        foreach (var building in owner.Buildables)
+        {
+            if (building == null) continue;
+            if (!includeAtSea)
+            {
+                if (MoveConstructionCommands.IsStored(building)) continue;
+                if (building.TryGetComponent<Boat>(out var boat) && boat.CurrentMooringPoint == null) continue;
+            }
+            movingBuildings.Add(building);
+        }
+
+        foreach (var building in movingBuildings)
         {
             var parent = building.transform.parent;
             var nested = false;
             while (parent != null)
             {
-                if (parent.GetComponent<Buildable>() is Buildable b && owned.Contains(b)) { nested = true; break; }
+                if (parent.GetComponent<Buildable>() is Buildable b && movingBuildings.Contains(b)) { nested = true; break; }
                 parent = parent.parent;
             }
             if (!nested) yield return building.transform;
         }
+
         foreach (var agent in owner.Agents)
         {
             if (agent == null) continue;
+            if (!includeAtSea)
+            {
+                if (agent.Boat != null && agent.Boat.CurrentMooringPoint == null) continue;
+                var nav = agent.ReturnNavigator(true);
+                if (nav != null && (nav.Terrain == Navigator.TerrainType.WaterSurface || nav.Terrain == Navigator.TerrainType.Underwater))
+                    continue;
+            }
             var parent = agent.transform.parent;
             var nested = false;
             while (parent != null)
             {
-                if (parent.GetComponent<Buildable>() is Buildable b && owned.Contains(b)) { nested = true; break; }
+                if (parent.GetComponent<Buildable>() is Buildable b && movingBuildings.Contains(b)) { nested = true; break; }
                 parent = parent.parent;
             }
             if (!nested) yield return agent.transform;
+        }
+
+        if (owner.Birds != null)
+        {
+            foreach (var bird in owner.Birds)
+            {
+                if (bird == null) continue;
+                if (!includeAtSea && (bird.State == Bird.BirdState.GettingItem || bird.State == Bird.BirdState.LeavingWorld))
+                    continue;
+                var parent = bird.transform.parent;
+                var nested = false;
+                while (parent != null)
+                {
+                    if (parent.GetComponent<Buildable>() is Buildable b && movingBuildings.Contains(b)) { nested = true; break; }
+                    parent = parent.parent;
+                }
+                if (!nested) yield return bird.transform;
+            }
         }
     }
 
@@ -70,14 +114,17 @@ public static class FleetKinematics
     {
         foreach (var building in owner.Buildables)
         {
-            if (building == null) continue;
+            if (building == null || MoveConstructionCommands.IsStored(building)) continue;
             building.OutlinePolygon?.Update(false);
             building.BlockingPolygon?.Update(false);
             foreach (var obstacle in building.GetComponentsInChildren<Obstacle>(true))
             {
                 if (obstacle == null) continue;
-                obstacle.Polygon?.Update(false);
-                try { obstacle.SetRadius(); } catch { }
+                if (obstacle.Polygon != null)
+                {
+                    obstacle.Polygon.Update(false);
+                    obstacle.SetRadius();
+                }
                 if (ObstaclePolygons?.GetValue(obstacle) is List<PathfindingPolygon> waters)
                     foreach (var water in waters) water?.Update(false);
             }

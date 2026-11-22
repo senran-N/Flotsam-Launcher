@@ -30,7 +30,7 @@ use tokio::{
 /// Bumped whenever the launcher wire format changes. A peer with a different
 /// value is rejected with an explicit "update the launcher" message instead of
 /// failing later in an unclear way.
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 const MAX_FRAME: usize = 32768;
 const LIMIT: usize = 8;
 /// Nothing useful is sent after this many handshake frames.
@@ -137,6 +137,7 @@ enum Admin {
 }
 struct Session {
     nickname: String,
+    ticket: String,
     status: Arc<Mutex<RoomStatus>>,
     /// Independent-mode interaction policy agreed at room creation and carried
     /// to the game plugin through network.json. The host owns the value; a
@@ -235,6 +236,7 @@ impl NetworkState {
 }
 pub(crate) struct GameConnection {
     pub nickname: String,
+    pub ticket: String,
     pub host: bool,
     pub address: std::net::SocketAddr,
     pub secret: String,
@@ -261,6 +263,7 @@ pub(crate) fn game_connection(state: &NetworkState) -> Result<GameConnection> {
     let rules = session.rules.lock().map_err(err)?.clone();
     Ok(GameConnection {
         nickname: session.nickname.clone(),
+        ticket: session.ticket.clone(),
         host: status.host,
         address,
         secret,
@@ -300,6 +303,8 @@ enum Wire {
         manifest: Option<crate::compat::Manifest>,
     },
     Welcome {
+        #[serde(default)]
+        ticket: String,
         #[serde(default)]
         manifest: Option<crate::compat::Manifest>,
         #[serde(default)]
@@ -670,7 +675,7 @@ fn snapshot_wire(status: &RoomStatus) -> Wire {
     }
 }
 enum Event {
-    Join(u64, Member, mpsc::Sender<Wire>, oneshot::Sender<bool>),
+    Join(u64, Member, mpsc::Sender<Wire>, oneshot::Sender<bool>, String),
     Leave(u64),
     Chat(u64, String),
     Latency(u64, u32),
@@ -782,11 +787,13 @@ async fn serve_peer(
             return Err(message);
         }
     };
+    let ticket = random_hex()?;
     let (tx, mut rx) = mpsc::channel(16);
     let (reply, accepted) = oneshot::channel();
     write_wire(
         &mut socket,
         &Wire::Welcome {
+            ticket: ticket.clone(),
             manifest: Some(manifest.clone()),
             rules: Some(rules.clone()),
             notice: notice.clone(),
@@ -805,6 +812,7 @@ async fn serve_peer(
             },
             tx,
             reply,
+            ticket,
         ))
         .await
         .map_err(err)?;
@@ -883,7 +891,14 @@ async fn serve_peer(
 }
 /// Host-side channels grouped into one value: passing four separate receivers
 /// through the same call site reads poorly and trips the argument-count lint.
+fn publish_admissions(path: &std::path::Path, tickets: &BTreeMap<u64,String>) -> Result<()> {
+    std::fs::create_dir_all(path.parent().ok_or("无效联机会话目录")?).map_err(err)?;
+    let pending=path.with_extension("pending");
+    std::fs::write(&pending,tickets.values().cloned().collect::<Vec<_>>().join("\n")).map_err(err)?;
+    std::fs::rename(pending,path).map_err(err)
+}
 struct HostChannels {
+    admissions: Option<std::path::PathBuf>,
     commands: mpsc::Receiver<String>,
     admin: mpsc::Receiver<Admin>,
     stop: watch::Receiver<bool>,
@@ -897,6 +912,7 @@ async fn host_loop(
     channels: HostChannels,
 ) {
     let HostChannels {
+        admissions,
         commands,
         admin,
         stop,
@@ -907,6 +923,7 @@ async fn host_loop(
     let mut peers: BTreeMap<u64, mpsc::Sender<Wire>> = BTreeMap::new();
     let mut tasks = JoinSet::new();
     let mut next = 1;
+    let mut tickets: BTreeMap<u64,String> = BTreeMap::new();
     let broadcast = |status: &Arc<Mutex<RoomStatus>>, peers: &BTreeMap<u64, mpsc::Sender<Wire>>| {
         if let Ok(snapshot) = status.lock().map(|s| s.clone()) {
             for tx in peers.values() {
@@ -927,8 +944,9 @@ async fn host_loop(
             },
             event=incoming.recv()=>{
                 let Some(event)=event else{break};
+                let admissions_changed=matches!(&event,Event::Join(..)|Event::Leave(..)|Event::Kick(..));
                 match event {
-                    Event::Join(id,member,tx,reply)=>{
+                    Event::Join(id,member,tx,reply,ticket)=>{
                         let accepted = match status.lock() {
                             Ok(mut s) if s.members.len() < LIMIT => {
                                 peers.insert(id,tx);
@@ -939,15 +957,26 @@ async fn host_loop(
                             Err(_) => false,
                         };
                         if !accepted { continue; }
+                        tickets.insert(id,ticket);
                     }
-                    Event::Leave(id)=>{peers.remove(&id);if let Ok(mut s)=status.lock(){s.members.retain(|m|m.id!=id);}},
+                    Event::Leave(id)=>{tickets.remove(&id);peers.remove(&id);if let Ok(mut s)=status.lock(){s.members.retain(|m|m.id!=id);}},
                     Event::Chat(id,text)=>{if let Ok(mut s)=status.lock(){add_message(&mut s,id,text);}}
                     Event::Latency(id,ms)=>{if let Ok(mut s)=status.lock(){if let Some(m)=s.members.iter_mut().find(|m|m.id==id){m.latency=ms;}}}
                     Event::Kick(id)=>{
+                        tickets.remove(&id);
                         if let Some(tx)=peers.remove(&id){
                             let _=tx.try_send(Wire::Kicked{reason:"房主将你移出房间".into()});
                         }
                         if let Ok(mut s)=status.lock(){s.members.retain(|m|m.id!=id);}
+                    }
+                }
+                if admissions_changed {
+                    if let Some(path)=&admissions {
+                        if let Err(error)=publish_admissions(path,&tickets) {
+                            let _=std::fs::remove_file(path);
+                            if let Ok(mut s)=status.lock(){s.error=format!("无法更新游戏房间成员：{error}");s.reason="admission".into();}
+                            break;
+                        }
                     }
                 }
                 broadcast(&status,&peers);
@@ -963,6 +992,7 @@ async fn host_loop(
             },
         }
     }
+    if let Some(path)=&admissions { let _=publish_admissions(path,&BTreeMap::new()); }
     tasks.abort_all();
     if let Ok(mut s) = status.lock() {
         s.connected = false;
@@ -1123,6 +1153,7 @@ fn register(
     let (stop, stop_rx) = watch::channel(false);
     *session = Some(Session {
         nickname,
+        ticket: String::new(),
         status: status.clone(),
         rules: Mutex::new(rules),
         commands,
@@ -1242,6 +1273,8 @@ pub async fn host_room(
             room_rules.clone(),
         )?
     };
+    let admissions=crate::service::app_root(&app)?.join("multiplayer/session/admissions");
+    publish_admissions(&admissions,&BTreeMap::new())?;
     tauri::async_runtime::spawn(host_loop(
         listener,
         secret,
@@ -1249,6 +1282,7 @@ pub async fn host_room(
         room_rules,
         status,
         HostChannels {
+            admissions: Some(admissions),
             commands: rx,
             admin,
             stop,
@@ -1323,6 +1357,7 @@ pub async fn join_room(
     let mut notice = String::new();
     let mut differences = vec![];
     let mut room_rules = Rules::default();
+    let mut game_ticket = String::new();
     let host_mode;
     let mut members = vec![];
     let mut messages = vec![];
@@ -1336,9 +1371,11 @@ pub async fn join_room(
         match read_wire(&mut socket).await? {
             Wire::Welcome {
                 manifest: remote,
+                ticket,
                 rules: received_rules,
                 notice: remote_notice,
             } => {
+                game_ticket = ticket;
                 if let Some(received) = received_rules {
                     room_rules = received;
                 }
@@ -1431,6 +1468,7 @@ pub async fn join_room(
         }
         register(&state, result.clone(), name, room_rules)?
     };
+    if let Some(session)=state.session.lock().map_err(err)?.as_mut(){session.ticket=game_ticket;}
     tauri::async_runtime::spawn(client_loop(socket, status, rx, stop));
     let _ = admin;
     Ok(result)
@@ -1873,7 +1911,7 @@ mod tests {
             ..Default::default()
         }));
         let (_tx, rx) = mpsc::channel(16);
-        let (_admin_tx, admin_rx) = mpsc::channel(8);
+        let (admin_tx, admin_rx) = mpsc::channel(8);
         let (stop, stop_rx) = watch::channel(false);
         // Manifests carry hex digests; peers validate them, so the fixtures are
         // hex too instead of arbitrary words.
@@ -1881,6 +1919,10 @@ mod tests {
         let loader = "b".repeat(64);
         let other_game = "c".repeat(64);
         let manifest = empty_manifest(&game, &loader);
+        let admission_root=std::env::temp_dir().join(format!("flotsam-admission-{}",random_hex().unwrap()));
+        std::fs::create_dir_all(&admission_root).unwrap();
+        let admission_file=admission_root.join("admissions");
+        publish_admissions(&admission_file,&BTreeMap::new()).unwrap();
         let host = tokio::spawn(host_loop(
             listener,
             secret.clone(),
@@ -1888,6 +1930,7 @@ mod tests {
             Rules::default(),
             status.clone(),
             HostChannels {
+                admissions: Some(admission_file.clone()),
                 commands: rx,
                 admin: admin_rx,
                 stop: stop_rx,
@@ -1922,6 +1965,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.lock().unwrap().members.len(), 2);
+        assert_eq!(std::fs::read_to_string(&admission_file).unwrap().lines().count(),1,"joined member must receive one game admission");
         write_wire(
             &mut client,
             &Wire::Chat {
@@ -1969,11 +2013,18 @@ mod tests {
             .members
             .iter()
             .any(|m| m.id != 0 && m.address == "127.0.0.1"));
+        let member=status.lock().unwrap().members.iter().find(|m|m.id!=0).unwrap().id;
+        admin_tx.send(Admin::Kick(member)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2),async {
+            loop{match read_wire(&mut client).await.unwrap(){Wire::Kicked{..}=>break,Wire::Ping{at}=>write_wire(&mut client,&Wire::Pong{at}).await.unwrap(),_=>{}}}
+        }).await.unwrap();
+        assert!(std::fs::read_to_string(&admission_file).unwrap().is_empty(),"kicking must revoke in-game access");
         stop.send(true).unwrap();
         host.await.unwrap();
         assert!(!status.lock().unwrap().connected);
         let rebound = TcpListener::bind(address).await.unwrap();
         drop(rebound);
+        std::fs::remove_dir_all(admission_root).unwrap();
     }
     #[test]
     fn disconnect_reasons_are_distinguishable() {

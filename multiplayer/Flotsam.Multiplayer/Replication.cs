@@ -10,19 +10,37 @@ internal sealed class Replication
 {
     private readonly Dictionary<int,long> _ids=new Dictionary<int,long>();
     private readonly Dictionary<long,Buildable> _buildings=new Dictionary<long,Buildable>();
-    private readonly Dictionary<long,(Vector3 pos,Quaternion rot)> _buildingTargets=new Dictionary<long,(Vector3,Quaternion)>();
+    private readonly PoseTrackMap _buildingTracks=new PoseTrackMap();
     private readonly Dictionary<long,Agent> _agents=new Dictionary<long,Agent>();
-    private readonly Dictionary<long,(Vector3 pos,Quaternion rot)> _agentTargets=new Dictionary<long,(Vector3,Quaternion)>();
+    private readonly PoseTrackMap _agentTracks=new PoseTrackMap();
+    private readonly SnapshotSpanClock _spanClock=new SnapshotSpanClock();
     private readonly Dictionary<string,BuildableProperties> _properties=new Dictionary<string,BuildableProperties>(StringComparer.Ordinal);
     private readonly Dictionary<string,ItemProperties> _items=new Dictionary<string,ItemProperties>(StringComparer.Ordinal);
     private long _nextId=1,_applied;
     private bool _catalog;
+    private readonly Dictionary<long,int> _knownBuildingPhases=new Dictionary<long,int>();
+    private readonly Dictionary<long,float> _agentAlertCooldowns=new Dictionary<long,float>();
     internal readonly EconomyReplication Economy=new EconomyReplication();
     internal readonly SalvageReplication Salvage=new SalvageReplication();
-    public void Reset(){ReplicaGeometry.Reset();MoveConstructionCommands.ResetClientPreviews();_ids.Clear();_buildings.Clear();_buildingTargets.Clear();_agents.Clear();_agentTargets.Clear();_properties.Clear();_items.Clear();_applied=0;_catalog=false;Economy.Reset();Salvage.Reset();}
-    public long Id(Buildable value)=>value!=null&&_ids.TryGetValue(value.GetInstanceID(),out var id)?id:0;
-    public long Id(Agent value)=>value!=null&&_ids.TryGetValue(value.GetInstanceID(),out var id)?id:0;
+    internal readonly BirdReplication Birds=new BirdReplication();
+    public void Reset(){ClientOceanAnchor.Reset();ReplicaFreeze.Reset();AgentReplication.Reset();FleetVisibility.Reset();FleetInteractions.Reset();SeaLootAndLandmarks.Reset();FleetHullCollision.Reset();LandmarkReplication.Reset();DecorationReplication.Reset();SpecialistReplication.Reset();ProgressionReplication.Reset();ReplicaGeometry.Reset();MoveConstructionCommands.ResetClientPreviews();NavigationReplication.Reset();FleetPhysicalActors.Reset();_ids.Clear();_buildings.Clear();_buildingTracks.Clear();_agents.Clear();_agentTracks.Clear();_knownBuildingPhases.Clear();_agentAlertCooldowns.Clear();_spanClock.Reset();_properties.Clear();_items.Clear();_applied=0;_catalog=false;Economy.Reset();Salvage.Reset();Birds.Reset();}
+    internal void InvalidateStaticCaches(){AgentReplication.InvalidateClientBudgets();Birds.InvalidateClientBudgets();}
+    public long Id(Buildable value)
+    {
+        if(value==null)return 0;
+        if(Plugin.Instance?.Network?.IsHost==true){var id=HostId(value);_buildings[id]=value;return id;}
+        return _ids.TryGetValue(value.GetInstanceID(),out var known)?known:0;
+    }
+    public long Id(Agent value)
+    {
+        if(value==null)return 0;
+        if(Plugin.Instance?.Network?.IsHost==true){var id=HostId(value);_agents[id]=value;return id;}
+        return _ids.TryGetValue(value.GetInstanceID(),out var known)?known:0;
+    }
     public long Id(Marker value)=>value!=null&&_ids.TryGetValue(value.GetInstanceID(),out var id)?id:0;
+    public long Id(Bird value)=>value!=null&&_ids.TryGetValue(value.GetInstanceID(),out var id)?id:0;
+    public Buildable? ResolveBuilding(long id)=>id>0&&_buildings.TryGetValue(id,out var b)?b:null;
+    public Agent? ResolveAgent(long id)=>id>0&&_agents.TryGetValue(id,out var a)?a:null;
     private long HostId(UnityEngine.Object value){var instance=value.GetInstanceID();if(!_ids.TryGetValue(instance,out var id)){id=_nextId++;_ids.Add(instance,id);}return id;}
     private void Catalog()
     {
@@ -39,6 +57,7 @@ internal sealed class Replication
     public WorldFrame Capture(long sequence)
     {
         Catalog();var community=Community.PlayerCommunity;
+        var nowPlayTime=GameManager.TimeManager!=null?GameManager.TimeManager.CurrentPlayTime:0f;
         var allCommunities=AllPlayerCommunities().ToArray();
         foreach(var pair in _buildings.ToArray())if(pair.Value==null)_buildings.Remove(pair.Key);
         var buildings=new List<BuildingState>();var agents=new List<AgentState>();
@@ -61,6 +80,10 @@ internal sealed class Replication
                     if(conn is EnergyGridBuildableComponent otherEgc&&otherEgc.Buildable!=null&&otherEgc.Buildable!=b)
                         eLinks.Add(HostId(otherEgc.Buildable));
             var state=new BuildingState{id=id,owner=owner.Name??"",properties=b.Properties.name,name=b.CustomName??"",x=p.x,y=p.y,z=p.z,rotation=b.transform.eulerAngles.y,visual=b.VisualIndex,phase=(int)b.BuildPhase,assignmentLimit=b.AssignmentLimit,active=b.IsActive,stored=MoveConstructionCommands.IsStored(b),health=b.Health,inventory=inventory.ToArray(),producer=Economy.Capture(b),neighbours=b.TryGetComponent<Construction>(out var construction)?construction.NeighbourConstructions.Where(n=>n!=null&&n.Buildable.Community==owner).Select(n=>HostId(n.Buildable)).ToArray():Array.Empty<long>(),energyLinks=eLinks.Distinct().ToArray(),mooredTo=mooredId,outline=b.OutlinePositions?.Select(v=>new PointState{x=v.x,z=v.y}).ToArray()??Array.Empty<PointState>()};
+            DecorationReplication.Capture(b,HostId,CaptureInventory,out state.decorations,out state.poleLinks);
+            SpecialistReplication.CaptureBuilding(b,state);
+            BuildingDurability.CaptureBuilding(b,state,nowPlayTime);
+            state.birdHouse=BirdReplication.CaptureBirdHouse(b);
             if(b.TryGetComponent<WalkwaySegment>(out var segment))
             {
                 var start=(Hookable)AccessTools.Field(typeof(WalkwaySegment),"_startHookable").GetValue(segment);var end=(Hookable)AccessTools.Field(typeof(WalkwaySegment),"_endHookable").GetValue(segment);
@@ -69,7 +92,7 @@ internal sealed class Replication
             buildings.Add(state);
         }
         foreach(var owner in allCommunities)
-        foreach(var a in owner.Agents){if(a==null)continue;var p=a.transform.position;var id=HostId(a);_agents[id]=a;var state=new AgentState{id=id,owner=owner.Name??"",name=a.Name,x=p.x,y=p.y,z=p.z,rotation=a.transform.eulerAngles.y,activity=(int)a.CurrentActivity};AgentReplication.Capture(a,state);state.inventory=CaptureInventory(a.Inventory);agents.Add(state);}
+        foreach(var a in owner.Agents){if(a==null)continue;var p=a.transform.position;var id=HostId(a);_agents[id]=a;var nav=a.ReturnNavigator(true);var boatId=a.Boat?.Buildable!=null?HostId(a.Boat.Buildable):0;var state=new AgentState{id=id,owner=owner.Name??"",name=a.Name,x=p.x,y=p.y,z=p.z,rotation=a.transform.eulerAngles.y,activity=(int)a.CurrentActivity,terrain=nav!=null?(int)nav.Terrain:1,boatId=boatId};AgentReplication.Capture(a,state);state.inventory=CaptureInventory(a.Inventory);agents.Add(state);}
         var world=GameManager.WorldManager.World;
         Economy.Prune(allCommunities.SelectMany(c=>c.Buildables));
         var fleetShips=allCommunities.Select(owner=>{
@@ -79,8 +102,9 @@ internal sealed class Replication
             var mapPos=FleetOwnedNavigation.SceneToMap(scenePos);
             var mapRot=(world.TownheartRotation*Quaternion.Euler(0f,sceneRot,0f)).eulerAngles.y;
             var isPrimary=ReferenceEquals(owner,community);
+            var shipKey=ShipKey(owner);
             return new FleetShipState{
-                name=owner.Name??"",
+                name=shipKey,
                 peerId=isPrimary?"host":FleetEngineBundle.OwnerIdOf(owner),
                 ownerName=isPrimary?(string.IsNullOrWhiteSpace(Plugin.Options.nickname)?"房主":Plugin.Options.nickname):FleetRuntime.ExtractShipOwnerName(owner.Name),
                 x=scenePos.x,z=scenePos.z,rotation=sceneRot,
@@ -88,14 +112,19 @@ internal sealed class Replication
                 energy=FleetEngineBundle.EnergyOf(owner),
                 buildings=owner.Buildables.Count(b=>b!=null),
                 agents=owner.Agents.Count(a=>a!=null),
+                birds=owner.Birds.Count(b=>b!=null),
                 researchPoints=owner.Research?.ResearchPoints??0,
                 researched=owner.Research?.ResearchedBuildableProperties.Select(p=>p.name).OrderBy(s=>s,StringComparer.Ordinal).ToArray()??Array.Empty<string>(),
                 unlockedTech=Economy.UnlockedTech(owner),
-                research=Economy.CaptureResearch(owner)
+                research=Economy.CaptureResearch(owner),
+                flareUntil=FleetVisibility.GetFlareUntil(shipKey,nowPlayTime),
+                hasWatchTower=FleetVisibility.HasActiveWatchTower(owner),
+                crippledHeart=BuildingDurability.IsShipHeartCrippled(owner),
+                allies=FleetVisibility.GetAlliesFor(shipKey,allCommunities)
             };
         }).ToArray();
-        var frame=new WorldFrame{sequence=sequence,worldOwner=community.Name??"",buildings=buildings.ToArray(),agents=agents.ToArray(),researchPoints=community.Research.ResearchPoints,researched=community.Research.ResearchedBuildableProperties.Select(p=>p.name).OrderBy(s=>s,StringComparer.Ordinal).ToArray(),worldX=world.TownheartWorldPosition.x,worldZ=world.TownheartWorldPosition.z,worldRotation=world.TownheartRotation.eulerAngles.y,speed=(int)GameSpeedManager.GameSpeed,research=Economy.CaptureResearch(community),unlockedTech=Economy.UnlockedTech(),rules=Plugin.Options.rules,ships=fleetShips,actions=FleetPhysicalActors.CaptureRecentActions()};
-        Salvage.Capture(frame,HostId);NavigationReplication.Capture(frame);frame.assets=AssetTable.Capture();return frame;
+        var frame=new WorldFrame{sequence=sequence,worldOwner=community.Name??"",buildings=buildings.ToArray(),agents=agents.ToArray(),researchPoints=community.Research.ResearchPoints,researched=community.Research.ResearchedBuildableProperties.Select(p=>p.name).OrderBy(s=>s,StringComparer.Ordinal).ToArray(),worldX=world.TownheartWorldPosition.x,worldZ=world.TownheartWorldPosition.z,worldRotation=world.TownheartRotation.eulerAngles.y,speed=(int)GameSpeedManager.GameSpeed,research=Economy.CaptureResearch(community),unlockedTech=Economy.UnlockedTech(),rules=Plugin.Options.rules,ships=fleetShips,actions=FleetPhysicalActors.CaptureRecentActions(),tradeOffers=FleetInteractions.CaptureOffers(),allianceRequests=FleetVisibility.CaptureRequests(),cannons=FleetCombat.Capture(),shells=FleetCombat.CaptureShells(),voyages=FleetVoyages.Capture()};
+        Salvage.Capture(frame,HostId);NavigationReplication.Capture(frame);LandmarkReplication.Capture(frame);Birds.Capture(frame,allCommunities,HostId);ProgressionReplication.Capture(frame);frame.assets=AssetTable.Capture();return frame;
     }
     public void Apply(WorldFrame frame)
     {
@@ -104,9 +133,9 @@ internal sealed class Replication
         AssetTable.Apply(frame.assets);
         Catalog();
         // The frame names the host's authoritative community. On an independent-mode
-        // client the local player community is its own ship, so the frame owner must be
-        // resolved by name instead of assuming PlayerCommunity.
-        var community=ResolveCommunity(frame.worldOwner)??Community.PlayerCommunity;
+        // client the local player community is its own ship, while vanilla Flotsam leaves
+        // the host's primary Community.Name empty (""). Resolve the host ship explicitly.
+        var community=ResolveShipCommunity(frame.worldOwner,"host")??Community.PlayerCommunity;
         var byName=new Dictionary<string,Community>(StringComparer.Ordinal);
         foreach(var candidate in Community.Communities)if(candidate!=null&&candidate.Name!=null)byName[candidate.Name]=candidate;
         Community Owned(string? name)=>!string.IsNullOrEmpty(name)&&byName.TryGetValue(name,out var found)?found:community;
@@ -114,45 +143,65 @@ internal sealed class Replication
         // markers. Applying their authoritative poses afterwards avoids moving
         // those replicas a second time in the same frame.
         var world=GameManager.WorldManager.World;
-        var worldPosition=new Vector3(frame.worldX,0,frame.worldZ);var worldRotation=Quaternion.Euler(0,frame.worldRotation,0);
         if(!Finite(frame.worldX)||!Finite(frame.worldZ)||!Finite(frame.worldRotation))throw new InvalidOperationException("Invalid world position");
-        if((world.TownheartWorldPosition-worldPosition).sqrMagnitude>.001f||Quaternion.Angle(world.TownheartRotation,worldRotation)>.1f)world.RepositionTownheart(worldPosition,worldRotation);
+        _spanClock.BeginFrame(Time.unscaledTime);
+        ReplicaFreeze.FreezePhysics(GameManager.WorldManager.WorldParent);
+        ClientOceanAnchor.SyncFrame(frame,world,_buildingTracks,_agentTracks,Salvage,Birds,_buildings.Values,_agents.Values);
+        if(frame.ships!=null)
+        {
+            foreach(var s in frame.ships)
+            {
+                if(s==null||!Finite(s.x)||!Finite(s.z)||!Finite(s.rotation))continue;
+                ClientOceanAnchor.HostToClientPose(s.x,s.z,s.rotation,out s.x,out s.z,out s.rotation);
+            }
+        }
         var used=new HashSet<int>(_buildings.Values.Where(b=>b!=null).Select(b=>b.GetInstanceID()));
         var alive=new HashSet<long>();
         foreach(var state in frame.buildings)
         {
             if(!Finite(state.x)||!Finite(state.y)||!Finite(state.z)||!Finite(state.rotation)||state.id<=0)throw new InvalidOperationException("Invalid building state");
             if(!alive.Add(state.id)||(state.owner?.Length??0)>64||!Enum.IsDefined(typeof(BuildPhase),state.phase)||!Finite(state.health)||state.health<0||state.health>1)throw new InvalidOperationException("Invalid building identity or phase");
+            ClientOceanAnchor.HostToClientPose(state.x,state.z,state.rotation,out var bx,out var bz,out var byaw);
             if(!_buildings.TryGetValue(state.id,out var building)||building==null)
             {
                 var owner=Owned(state.owner);
-                building=owner.Buildables.FirstOrDefault(b=>b!=null&&!used.Contains(b.GetInstanceID())&&b.Properties.name==state.properties&&(b.transform.position-new Vector3(state.x,state.y,state.z)).sqrMagnitude<1);
+                building=owner.Buildables.FirstOrDefault(b=>b!=null&&!used.Contains(b.GetInstanceID())&&b.Properties.name==state.properties&&(b.transform.position-new Vector3(bx,state.y,bz)).sqrMagnitude<1);
                 if(building==null)
                 {
                     if(!_properties.TryGetValue(state.properties,out var properties)||properties.Prefab==null)throw new InvalidOperationException("Missing buildable: "+state.properties);
-                    building=UnityEngine.Object.Instantiate(properties.Prefab,new Vector3(state.x,state.y,state.z),Quaternion.Euler(0,state.rotation,0));
+                    building=UnityEngine.Object.Instantiate(properties.Prefab,new Vector3(bx,state.y,bz),Quaternion.Euler(0,byaw,0));
                     if(state.outline.Length>256||state.outline.Any(v=>!Finite(v.x)||!Finite(v.z)))throw new InvalidOperationException("Invalid building outline");
                     building.Initialize(owner,state.visual,state.outline.Length>0?state.outline.Select(v=>new Vector2(v.x,v.z)).ToArray():null,true);
                     building.RestorePhase((BuildPhase)state.phase);
                 }
                 _buildings[state.id]=building;_ids[building.GetInstanceID()]=state.id;used.Add(building.GetInstanceID());
-                foreach(var body in building.GetComponentsInChildren<Rigidbody>())body.isKinematic=true;
             }
-            var targetBPos=new Vector3(state.x,state.y,state.z);var targetBRot=Quaternion.Euler(0,state.rotation,0);
-            if(!_buildingTargets.ContainsKey(state.id)||(building.transform.position-targetBPos).sqrMagnitude>625f||state.walkway!=null)
-                building.transform.SetPositionAndRotation(targetBPos,targetBRot);
-            _buildingTargets[state.id]=(targetBPos,targetBRot);
+            ReplicaFreeze.FreezeBuilding(building);
+            var targetBPose=new PoseSample(bx,state.y,bz,byaw);
+            if(_buildingTracks.UpdateTarget(state.id,ReplicaFreeze.CurrentPose(building.transform),targetBPose,625f))
+                ReplicaFreeze.ApplyPose(building.transform,targetBPose);
             if(building.CustomName!=state.name)building.Name=state.name;
             if((int)building.BuildPhase!=state.phase)building.RestorePhase((BuildPhase)state.phase);
             if(building.IsActive!=state.active){if(state.active)building.Activate();else building.Deactivate();}
             building.AssignmentLimit=state.assignmentLimit;
             ApplyInventory(building.Inventory,state.inventory);
             Economy.Apply(building,state.producer);
+            ReplicaFreeze.SyncProducerVisualActivity(building,state.producer);
+            DecorationReplication.ApplyDecorations(building,state.decorations,ApplyInventory);
+            SpecialistReplication.ApplyBuilding(building,state,_items);
+            BirdReplication.ApplyBirdHouse(building,state.birdHouse);
             AccessTools.PropertySetter(typeof(Buildable),nameof(Buildable.Health)).Invoke(building,new object[]{state.health});
             if(building.SpawnedVisual!=null)building.SpawnedVisual.SetProgress(state.health);
+            BuildingDurability.ApplyBuildingClient(building,state,frame.playTime);
             MoveConstructionCommands.ApplyStoredState(building,state.stored);
+            if(_knownBuildingPhases.TryGetValue(state.id,out var prevPhase)&&prevPhase!=(int)BuildPhase.Finished&&state.phase==(int)BuildPhase.Finished&&_applied>0&&ReferenceEquals(building.Community,Community.PlayerCommunity))
+            {
+                FleetPhysicalActors.PlayFleetSound("cargo_deliver",building.transform.position,0.78f);
+                FleetPhysicalActors.SpawnNativePopup(building.transform.position+Vector3.up*2.4f,$"🔨 {building.Name} 建造完工");
+            }
+            _knownBuildingPhases[state.id]=state.phase;
         }
-        foreach(var pair in _buildings.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null){_ids.Remove(pair.Value.GetInstanceID());MoveConstructionCommands.ForgetStored(pair.Value);pair.Value.Remove();}_buildings.Remove(pair.Key);_buildingTargets.Remove(pair.Key);}
+        foreach(var pair in _buildings.ToArray())if(!alive.Contains(pair.Key)){if(pair.Value!=null){_ids.Remove(pair.Value.GetInstanceID());MoveConstructionCommands.ForgetStored(pair.Value);pair.Value.Remove();}_buildings.Remove(pair.Key);_buildingTracks.Remove(pair.Key);_knownBuildingPhases.Remove(pair.Key);}
         foreach(var state in frame.buildings)
         {
             if(state.stored)continue;
@@ -163,11 +212,12 @@ internal sealed class Replication
                 // is skipped. The client never runs simulation/pathfinding, so the road is visual and
                 // structural only; enabling client simulation would require adding that call here.
                 var s=state.walkway;
-                var startVector=new Vector3(s.x1,0,s.z1);var endVector=new Vector3(s.x2,0,s.z2);
                 // A walkway whose geometry or endpoints are not resolvable yet is left for the next
                 // authoritative frame instead of failing the whole replica: the host re-sends the
                 // same state, and one bad segment must not force a full resync.
                 var valid=Finite(s.length)&&s.length>=1&&s.length<=1000&&Finite(s.x1)&&Finite(s.z1)&&Finite(s.x2)&&Finite(s.z2);
+                var startVector=valid?ClientOceanAnchor.HostToClientPos(new Vector3(s.x1,0,s.z1)):Vector3.zero;
+                var endVector=valid?ClientOceanAnchor.HostToClientPos(new Vector3(s.x2,0,s.z2)):Vector3.zero;
                 if(!valid)Plugin.Log("Skipped walkway with invalid geometry");
                 else if(!_buildings.TryGetValue(s.start,out var start)||start==null||!_buildings.TryGetValue(s.end,out var end)||end==null||!start.TryGetComponent<Hookable>(out var startHook)||!end.TryGetComponent<Hookable>(out var endHook))Plugin.Log("Skipped walkway with unresolved endpoints");
                 else if(AccessTools.Field(typeof(WalkwaySegment),"_startTransform").GetValue(segment)==null){segment.InitializeSegment(startVector,endVector,startHook,endHook,s.length);segment.UpdateScale();}
@@ -187,13 +237,34 @@ internal sealed class Replication
             }
             if(state.mooredTo>0&&_buildings.TryGetValue(state.id,out var boatBuilding)&&boatBuilding!=null&&boatBuilding.TryGetComponent<Boat>(out var repBoat)&&_buildings.TryGetValue(state.mooredTo,out var dockBuilding)&&dockBuilding!=null&&dockBuilding.TryGetComponent<MooringPoint>(out var repDock))
             {
-                if(repDock.LinkedBoat!=repBoat)try{repDock.LinkBoat(repBoat);repDock.MoorBoat(repBoat,true);}catch{}
+                if(repDock.LinkedBoat!=repBoat)
+                {
+                    try{repDock.LinkBoat(repBoat);repDock.MoorBoat(repBoat,true);}
+                    catch(Exception e){Plugin.Log("Replica moor sync skipped: "+e.GetType().Name);}
+                }
             }
-            if(state.energyLinks!=null&&state.energyLinks.Length>0&&_buildings.TryGetValue(state.id,out var eSrc)&&eSrc!=null&&eSrc.TryGetComponent<EnergyGridBuildableComponent>(out var srcComp))
+            if(_buildings.TryGetValue(state.id,out var eSrc)&&eSrc!=null&&eSrc.TryGetComponent<EnergyGridBuildableComponent>(out var srcComp))
             {
-                foreach(var otherId in state.energyLinks)
+                var wantedLinks=new HashSet<long>(state.energyLinks??Array.Empty<long>());
+                if(srcComp.Connections!=null)
+                {
+                    foreach(var conn in srcComp.Connections.ToArray())
+                    {
+                        if(conn is EnergyGridBuildableComponent existingDst&&existingDst.Buildable!=null&&_ids.TryGetValue(existingDst.Buildable.GetInstanceID(),out var existingId)&&!wantedLinks.Contains(existingId))
+                        {
+                            try{EnergyGrid.Disconnect(srcComp,existingDst);}
+                            catch(Exception e){Plugin.Log("Replica energy disconnect skipped: "+e.GetType().Name);}
+                        }
+                    }
+                }
+                foreach(var otherId in wantedLinks)
+                {
                     if(_buildings.TryGetValue(otherId,out var eDst)&&eDst!=null&&eDst.TryGetComponent<EnergyGridBuildableComponent>(out var dstComp)&&!srcComp.IsConnected(dstComp))
-                        try{EnergyGrid.Connect(srcComp,dstComp);}catch{}
+                    {
+                        try{EnergyGrid.Connect(srcComp,dstComp);}
+                        catch(Exception e){Plugin.Log("Replica energy connect skipped: "+e.GetType().Name);}
+                    }
+                }
             }
             if(!_buildings[state.id].TryGetComponent<Construction>(out var construction))continue;
             if(state.neighbours.Length>128)throw new InvalidOperationException("Invalid construction connections");
@@ -202,38 +273,55 @@ internal sealed class Replication
             foreach(var old in construction.NeighbourConstructions.ToArray())if(!desired.Contains(old))construction.RemoveNeighbour(old);
             foreach(var next in desired)if(!construction.NeighbourConstructions.Contains(next))construction.AddNeighbourConstruction(next);
         }
+        DecorationReplication.ApplyPoleLinks(_buildings,_ids,frame.buildings);
         foreach(var building in _buildings.Values)ReplicaGeometry.RefreshReplicaPose(building);
         var assigned=new HashSet<int>(_agents.Values.Where(a=>a!=null).Select(a=>a.GetInstanceID()));
         var aliveAgents=new HashSet<long>();
         foreach(var state in frame.agents)
         {
             if(state.id<=0||(state.owner?.Length??0)>64||!aliveAgents.Add(state.id)||!Finite(state.x)||!Finite(state.y)||!Finite(state.z)||!Finite(state.rotation)||!Enum.IsDefined(typeof(Activity),state.activity))throw new InvalidOperationException("Invalid agent state");
+            ClientOceanAnchor.HostToClientPose(state.x,state.z,state.rotation,out var ax,out var az,out var ayaw);
             var agentOwner=Owned(state.owner);
             if(!_agents.TryGetValue(state.id,out var agent)||agent==null)
             {
                 agent=agentOwner.Agents.FirstOrDefault(a=>a!=null&&!assigned.Contains(a.GetInstanceID())&&a.Descriptor.UniqueID==state.descriptorId);
                 if(agent==null)agent=AgentReplication.Spawn(state,agentOwner);
-                _agents[state.id]=agent;_ids[agent.GetInstanceID()]=state.id;assigned.Add(agent.GetInstanceID());agent.SetName(state.name);agent.StopAllCoroutines();
-                foreach(var body in agent.GetComponentsInChildren<Rigidbody>())body.isKinematic=true;
+                _agents[state.id]=agent;_ids[agent.GetInstanceID()]=state.id;assigned.Add(agent.GetInstanceID());agent.SetName(state.name);
             }
-            if(!Finite(state.x)||!Finite(state.y)||!Finite(state.z))throw new InvalidOperationException("Invalid agent position");
-            var targetAPos=new Vector3(state.x,state.y,state.z);var targetARot=Quaternion.Euler(0,state.rotation,0);
-            if(!_agentTargets.ContainsKey(state.id)||(agent.transform.position-targetAPos).sqrMagnitude>400f)
-                agent.transform.SetPositionAndRotation(targetAPos,targetARot);
-            _agentTargets[state.id]=(targetAPos,targetARot);
-            agent.CurrentActivity=(Activity)state.activity;
+            ReplicaFreeze.FreezeAgent(agent);
+            var targetAPose=new PoseSample(ax,state.y,az,ayaw);
+            if(_agentTracks.UpdateTarget(state.id,ReplicaFreeze.CurrentPose(agent.transform),targetAPose,400f))
+                ReplicaFreeze.ApplyPose(agent.transform,targetAPose);
+            var boardedBoat=state.boatId>0&&_buildings.TryGetValue(state.boatId,out var boatBuildable)&&boatBuildable!=null&&boatBuildable.TryGetComponent<Boat>(out var boatComp)?boatComp:null;
+            ReplicaFreeze.SyncAgentVisualState(agent,(Activity)state.activity,state.terrain,boardedBoat);
             AgentReplication.Apply(agent,state);ApplyInventory(agent.Inventory,state.inventory);
+            if(_applied>0&&ReferenceEquals(agentOwner,Community.PlayerCommunity)&&(state.hunger>0.88f||state.thirst>0.88f||!string.IsNullOrEmpty(state.disease))&&(!_agentAlertCooldowns.TryGetValue(state.id,out var alertCd)||Time.realtimeSinceStartup>=alertCd))
+            {
+                _agentAlertCooldowns[state.id]=Time.realtimeSinceStartup+25f;
+                Plugin.Instance?.Network?.ShowNotice(!string.IsNullOrEmpty(state.disease)?$"⚠ 船员 {state.name} 感染疾病，请安排诊所治疗！":$"⚠ 船员 {state.name} 极度饥渴，请补充食物/淡水！",true);
+            }
         }
-        foreach(var pair in _agents.ToArray())if(!aliveAgents.Contains(pair.Key)){if(pair.Value!=null){var owner=pair.Value.Community??community;owner.RemoveAgent(pair.Value);UnityEngine.Object.Destroy(pair.Value.gameObject);}_agents.Remove(pair.Key);_agentTargets.Remove(pair.Key);}
-        if(frame.rules!=null)Plugin.Options.rules=frame.rules;
+        foreach(var pair in _agents.ToArray())if(!aliveAgents.Contains(pair.Key)){if(pair.Value!=null){var owner=pair.Value.Community??community;owner.RemoveAgent(pair.Value);UnityEngine.Object.Destroy(pair.Value.gameObject);}_agents.Remove(pair.Key);_agentTracks.Remove(pair.Key);_agentAlertCooldowns.Remove(pair.Key);}
+        if(frame.rules!=null)
+        {
+            var wasFriendlyFire=Plugin.Options.rules.friendlyFire;
+            var firstSync=_applied<=0;
+            Plugin.Options.rules=frame.rules;
+            if(!firstSync&&wasFriendlyFire!=frame.rules.friendlyFire&&Plugin.Options.mode=="independent")
+                Plugin.Instance?.Network?.ShowNotice(frame.rules.friendlyFire?"房主已开启炮战，请进入本船炮位手动瞄准开火":"房主已关闭海战火炮规则",false);
+        }
         FleetPhysicalActors.ApplyRemoteActions(frame.actions);
+        FleetCombat.Apply(frame);
+        FleetVoyages.Apply(frame.voyages);
         if(frame.ships!=null&&frame.ships.Length>0)
         {
             foreach(var shipState in frame.ships)
             {
                 if(shipState==null)continue;
-                var shipCommunity=ResolveCommunity(shipState.name);
-                if(shipCommunity?.Research==null)continue;
+                var shipCommunity=ResolveShipCommunity(shipState.name,shipState.peerId);
+                if(shipCommunity==null)continue;
+                FleetEngineBundle.SyncEnergy(shipCommunity,shipState.energy);
+                if(shipCommunity.Research==null)continue;
                 shipCommunity.Research.ResearchPoints=shipState.researchPoints;
                 foreach(var key in shipState.researched)
                     if(_properties.TryGetValue(key,out var prop)&&!shipCommunity.Research.ResearchedBuildableProperties.Contains(prop))
@@ -255,34 +343,49 @@ internal sealed class Replication
             Economy.ApplyResearch(frame.research,frame.unlockedTech,community);
         }
         Salvage.Apply(frame,(obj,id)=>_ids[obj.GetInstanceID()]=id);
+        Birds.Apply(frame,_buildings,Owned,(obj,id)=>_ids[obj.GetInstanceID()]=id,obj=>_ids.Remove(obj.GetInstanceID()),_items);
         NavigationReplication.Apply(frame);
+        LandmarkReplication.Apply(frame);
+        ProgressionReplication.Apply(frame);
         Community.PlayerCommunity?.Inventory?.LateUpdate();
         _applied=frame.sequence;
     }
     public void Interpolate(float dt)
     {
         if(dt<=0f||dt>0.25f)return;
-        var t=Mathf.Clamp01(dt*14f);
+        var alpha=_spanClock.Advance(dt);
+        var waveTime=Time.unscaledTime;
         var movedBuildings=false;
-        foreach(var pair in _buildingTargets)
+        for(var boatPass=0;boatPass<2;boatPass++)
         {
-            if(!_buildings.TryGetValue(pair.Key,out var b)||b==null||b.TryGetComponent<WalkwaySegment>(out _))continue;
-            var cur=b.transform.position;
-            if((cur-pair.Value.pos).sqrMagnitude>0.0001f||Quaternion.Angle(b.transform.rotation,pair.Value.rot)>0.08f)
+            foreach(var pair in _buildings)
             {
-                b.transform.SetPositionAndRotation(Vector3.Lerp(cur,pair.Value.pos,t),Quaternion.Slerp(b.transform.rotation,pair.Value.rot,t));
-                movedBuildings=true;
+                var b=pair.Value;
+                if(b==null)continue;
+                if(boatPass==1)ReplicaFreeze.ApplyBuildingWaveBob(b,waveTime);
+                if((b.TryGetComponent<Boat>(out _)==(boatPass==0))||!_buildingTracks.Sample(pair.Key,alpha,out var pose))continue;
+                var cur=ReplicaFreeze.CurrentPose(b.transform);
+                if(cur.DistanceSq(pose)>0.000001f||cur.AngleDeltaAbs(pose)>0.05f)
+                {
+                    ReplicaFreeze.ApplyPose(b.transform,pose);
+                    movedBuildings=true;
+                }
             }
         }
         if(movedBuildings)foreach(var b in _buildings.Values)if(b!=null)ReplicaGeometry.RefreshReplicaPose(b);
-        foreach(var pair in _agentTargets)
+        foreach(var pair in _agents)
         {
-            if(!_agents.TryGetValue(pair.Key,out var a)||a==null)continue;
-            var cur=a.transform.position;
-            if((cur-pair.Value.pos).sqrMagnitude>0.0001f||Quaternion.Angle(a.transform.rotation,pair.Value.rot)>0.1f)
-                a.transform.SetPositionAndRotation(Vector3.Lerp(cur,pair.Value.pos,t),Quaternion.Slerp(a.transform.rotation,pair.Value.rot,t));
+            var a=pair.Value;
+            if(a==null||!_agentTracks.Sample(pair.Key,alpha,out var pose))continue;
+            var cur=ReplicaFreeze.CurrentPose(a.transform);
+            var distSq=cur.DistanceSq(pose);
+            if(distSq>0.000001f||cur.AngleDeltaAbs(pose)>0.05f)
+                ReplicaFreeze.ApplyPose(a.transform,pose);
+            ReplicaFreeze.DriveClientAgentMotion(a,Mathf.Sqrt(distSq),dt);
         }
-        Salvage.Interpolate(dt);
+        Salvage.Interpolate(alpha);
+        Birds.Interpolate(alpha);
+        NavigationReplication.Interpolate(alpha);
     }
     private void ApplyInventory(Inventory inventory,ItemCount[] incoming)
     {
@@ -295,9 +398,12 @@ internal sealed class Replication
         }
         foreach(var section in inventory.SubInventoryTypes.ToArray())
         {
-            foreach(var item in inventory.ReturnAllItems(section,new List<Item>()))if(item.IsReserved)item.CancelReservation();
             desired.TryGetValue(section,out var wanted);
-            var current=inventory.ReturnAllItems(section,new List<Item>()).GroupBy(i=>i.Properties.name).ToDictionary(g=>g.Key,g=>g.Count());
+            var existingItems=inventory.ReturnAllItems(section,new List<Item>());
+            if((wanted==null||wanted.Count==0)&&existingItems.Count==0)continue;
+            var current=existingItems.GroupBy(i=>i.Properties.name).ToDictionary(g=>g.Key,g=>g.Count());
+            if(wanted!=null&&wanted.Count==current.Count&&wanted.All(kv=>current.TryGetValue(kv.Key,out var cn)&&cn==kv.Value))continue;
+            foreach(var item in existingItems)if(item.IsReserved)item.CancelReservation();
             foreach(var pair in current){var target=wanted!=null&&wanted.TryGetValue(pair.Key,out var n)?n:0;for(var i=target;i<pair.Value;i++)inventory.RemoveItem(_items[pair.Key],section);}
             if(wanted!=null)foreach(var pair in wanted){current.TryGetValue(pair.Key,out var n);for(var i=n;i<pair.Value;i++)if(!inventory.AddItem(new Item(_items[pair.Key]),section))throw new InvalidOperationException("Replica inventory capacity mismatch");}
         }
@@ -309,12 +415,33 @@ internal sealed class Replication
         return result.ToArray();
     }
     internal static bool Finite(float value)=>!float.IsNaN(value)&&!float.IsInfinity(value);
-    internal static Community? ResolveCommunity(string name)
+    internal static string ShipKey(Community? community)=>
+        community==null?"":(!string.IsNullOrEmpty(community.Name)?community.Name:"host");
+    internal static Community? ResolveCommunity(string? name)
     {
         if(string.IsNullOrEmpty(name))return null;
+        if(name=="host")return ResolveShipCommunity("host","host");
         foreach(var community in Community.Communities)
             if(community!=null&&community.Name==name)return community;
         return null;
+    }
+    internal static Community? ResolveShipCommunity(string? nameOrKey,string? peerId=null)
+    {
+        if(!string.IsNullOrEmpty(nameOrKey)&&nameOrKey!="host")
+        {
+            foreach(var c in Community.Communities)
+                if(c!=null&&c.Name==nameOrKey)return c;
+            return null;
+        }
+        var byHostId=FleetEngineBundle.FindShipById("host");
+        if(byHostId!=null)return byHostId;
+        foreach(var c in Community.Communities)
+        {
+            if(c==null||(!string.IsNullOrEmpty(c.Name)&&c.Name.StartsWith("Ship:",StringComparison.Ordinal)))continue;
+            if(c.Buildables.Any(b=>b!=null&&(b.TryGetComponent<TownheartStorage>(out _)||b.TryGetComponent<Engine>(out _))))
+                return c;
+        }
+        return peerId=="host"||string.IsNullOrEmpty(nameOrKey)?Community.PlayerCommunity:null;
     }
     public string? Execute(GameCommand command,Community? actorCommunity=null)
     {
@@ -322,14 +449,25 @@ internal sealed class Replication
         if(!Finite(command.x)||!Finite(command.z)||!Finite(command.rotation))return "坐标无效";
         Catalog();
         var targetCommunity=actorCommunity??Community.PlayerCommunity;
+        if(command.target>0 && _buildings.TryGetValue(command.target,out var ownedTarget) && ownedTarget!=null && ownedTarget.Community!=targetCommunity
+            && !FleetInteractions.Handles(command.kind)) return "不能操作其他船主的建筑";
+
         var heartPos=FleetEngineBundle.RootFor(targetCommunity)?.transform.position??Construction.TownheartPosition;
         var targetRoot=FleetEngineBundle.RootFor(targetCommunity)??Construction.Townheart;
         if(command.kind==ConstructionCommands.PlaceRoad)return ConstructionCommands.Execute(command,_properties,_buildings,targetCommunity);
         if(MoveConstructionCommands.Handles(command.kind))return MoveConstructionCommands.Execute(command,_buildings,targetCommunity);
+        if(DecorationReplication.Handles(command.kind))return DecorationReplication.Execute(command,_buildings,targetCommunity);
+        if(SpecialistReplication.HandlesBuilding(command.kind))return SpecialistReplication.ExecuteBuilding(command,_buildings,_items,targetCommunity);
+        if(SpecialistReplication.HandlesAgent(command.kind))return SpecialistReplication.ExecuteAgent(command,_agents,_items,targetCommunity);
+        if(BirdReplication.Handles(command.kind))return Birds.Execute(command,_buildings,targetCommunity);
+        if(ProgressionReplication.Handles(command.kind))return ProgressionReplication.Execute(command,targetCommunity);
+        if(BuildingDurability.Handles(command.kind))return BuildingDurability.ExecuteRepair(command,_buildings,targetCommunity);
+        if(FleetVisibility.Handles(command.kind))return FleetVisibility.Execute(command,targetCommunity);
         if(command.kind=="researchStart"||command.kind=="researchCancel")return Economy.ExecuteGlobal(command,targetCommunity);
         if(command.kind.StartsWith("marker",StringComparison.Ordinal))return Salvage.Execute(command,targetCommunity);
-        if(command.kind=="shipTransfer"||command.kind=="shipSteal"||command.kind=="shipAttack")return ExecuteFleetInteraction(command,targetCommunity,heartPos);
-        if(command.kind=="speed"||command.kind=="speedZero"||command.kind=="mapOpen"||command.kind=="mapClose"||command.kind=="navigate"||command.kind=="navigateKeys"||command.kind=="navigateStop")return NavigationReplication.Execute(command);
+        if(LandmarkReplication.Handles(command.kind))return LandmarkReplication.Execute(command,targetCommunity,_items);
+        if(FleetInteractions.Handles(command.kind))return FleetInteractions.Execute(command,targetCommunity,heartPos,_buildings,HostId);
+        if(command.kind=="speed"||command.kind=="speedZero"||command.kind=="mapOpen"||command.kind=="mapClose"||command.kind=="navigate"||command.kind=="navigatePlan"||command.kind=="navigateKeys"||command.kind=="navigateStop")return NavigationReplication.Execute(command);
         if(command.kind=="agentRename"||command.kind=="agentAssignment")
         {
             if(!_agents.TryGetValue(command.target,out var agent)||agent==null||agent.Community!=targetCommunity)return "居民已不存在或不属于你的船只";
@@ -355,21 +493,7 @@ internal sealed class Replication
             return null;
         }
         if(command.kind=="energyConnect"||command.kind=="energyDisconnect")
-        {
-            if(!_buildings.TryGetValue(command.target,out var bA)||bA==null||!_buildings.TryGetValue(command.reference,out var bB)||bB==null)return "电力节点建筑已不存在";
-            if(bA.Community!=targetCommunity||bB.Community!=targetCommunity)return "只能连接同一艘船上的电力节点";
-            if(!bA.TryGetComponent<EnergyGridBuildableComponent>(out var cA)||!bB.TryGetComponent<EnergyGridBuildableComponent>(out var cB))return "目标建筑不支持电力连线";
-            if(command.kind=="energyDisconnect"){EnergyGrid.Disconnect(cA,cB);return null;}
-            if(cA.IsConnected(cB))return "两个电力节点已经连接";
-            if(cB.ConnectionTransform!=null&&!cA.IsInRange(cB.ConnectionTransform.position))return "两个电力节点距离过远";
-            if(command.value>=0)
-            {
-                if(!cA.CanConnect((uint)command.value))return "该电力接口已满";
-                EnergyGrid.ConnectWithIndex(cA,(uint)command.value,cB);
-            }
-            else EnergyGrid.Connect(cA,cB);
-            return null;
-        }
+            return DecorationReplication.ExecuteEnergyCommand(command,_buildings,targetCommunity);
         if(command.kind=="place")
         {
             using var _scope=FleetRuntime.WithPlayerCommunity(targetCommunity);
@@ -377,7 +501,7 @@ internal sealed class Replication
             if(!GameSettings.Instance.BuildableSettings.Buildables.Contains(p)||p.Prefab.GetComponent<TownheartStorage>()!=null)return "此建筑不能直接建造";
             if(!p.IsUnlocked())return "建筑尚未解锁";
             if(p.PlacementCursorProperties is LineConstructionCursorProperties)return "道路必须使用双端点原生道路建造指令";
-            if(p.UseCustomSize||p.RequiresMooringPoint||p.Outline==null||p.Outline.Length<3||!(p.PlacementCursorProperties is SingleConstructionCursorProperties))return "此建筑的联机放置适配尚未完成";
+            if(p.RequiresMooringPoint||p.Outline==null||p.Outline.Length<3||!(p.PlacementCursorProperties is SingleConstructionCursorProperties))return "此建筑的联机放置适配尚未完成";
             if(command.visual<0||p.Visuals==null||command.visual>=p.Visuals.Length)return "建筑外观无效";
             if(!p.ReturnCanBePlaced(targetCommunity,true))return "资源或建筑条件不满足";
             var position=new Vector3(command.x,0,command.z);
@@ -401,12 +525,8 @@ internal sealed class Replication
         if(!_buildings.TryGetValue(command.target,out var building)||building==null)return "目标已不存在";
         if(building.Community!=targetCommunity)
         {
-            // Cross-ship interaction is a room policy, decided by the host before
-            // the session and enforced here on the authoritative instance.
-            if(building.Community==null||!Plugin.Options.rules.Allows(command.kind))return "房主未开启对其他船只的该操作";
-            targetCommunity=building.Community;
+            return "他船经营权限属于船主，请通过运输、登船或炮击进行跨船互动";
         }
-        if(MoveConstructionCommands.IsQuarantined(building))return "建筑状态不确定，已隔离，请房主重新载入存档";
         if(MoveConstructionCommands.IsStored(building))return "建筑已收纳，请先从库存放置";
         if(command.kind.StartsWith("recipe",StringComparison.Ordinal)||command.kind=="queueCancel"||command.kind=="producerPriority")return Economy.Execute(building,command);
         switch(command.kind)
@@ -421,152 +541,60 @@ internal sealed class Replication
             default:return "尚未适配的游戏指令";
         }
     }
-    private string? ExecuteFleetInteraction(GameCommand command,Community actor,Vector3 actorPos)
+    internal static bool IsTradableSection(SubInventoryType section)=>
+        section==SubInventoryType.Storage||section==SubInventoryType.Liquid||section==SubInventoryType.Export;
+    internal static string CleanItemName(ItemProperties? prop)
     {
-        var reqAmount=Mathf.Clamp(command.amount<=0?5:command.amount,1,9999);
-        if(command.text=="__practice__")
+        if(prop==null)return "物资";
+        var loc=prop.LocalizedName;
+        if(!string.IsNullOrWhiteSpace(loc))
         {
-            var practiceEnd=FleetPhysicalActors.GetOrSpawnPracticeTarget(actorPos);
-            var label=$"{FormatCategoryLabel(command.properties)} ×{reqAmount}";
-            FleetPhysicalActors.RecordAndSpawn(command.kind,label,actorPos,practiceEnd);
-            return null;
+            var line=loc.Split(new[]{'\r','\n'},StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim();
+            if(!string.IsNullOrEmpty(line))return line!;
         }
-        if(!Plugin.Options.rules.Allows(command.kind))return "当前房间规则未开启该跨船操作";
-        Buildable? clickedBuilding=null;
-        if(command.target>0)_buildings.TryGetValue(command.target,out clickedBuilding);
-        var other=clickedBuilding?.Community!=null&&!ReferenceEquals(clickedBuilding.Community,actor)
-            ?clickedBuilding.Community
-            :ResolveCommunity(command.text);
-        if(other==null||ReferenceEquals(other,actor))return "目标船只不存在";
-        var otherPos=clickedBuilding!=null?clickedBuilding.transform.position:(FleetEngineBundle.RootFor(other)?.transform.position??Construction.TownheartPosition);
-        if(command.kind=="shipTransfer")
-        {
-            var extracted=ExtractItemsFromShip(actor,command.properties,reqAmount);
-            if(extracted.Count==0)return $"我方船只库存中没有可调配的 {FormatCategoryLabel(command.properties)}";
-            var itemLabel=$"{FormatCategoryLabel(command.properties)} ×{extracted.Count}";
-            FleetPhysicalActors.RecordAndSpawn("shipTransfer",itemLabel,actorPos,otherPos,onArriveTarget:()=>
-            {
-                foreach(var prop in extracted)if(prop!=null)other.SpawnItemToAvailableStorage(prop);
-                FleetPhysicalActors.SpawnNativePopup(otherPos+Vector3.up*2.8f,$"收到商船卸货：{itemLabel}");
-            });
-            return null;
-        }
-        if((otherPos-actorPos).sqrMagnitude>160f*160f)return "距离过远，请先将船驶近至 160m 内";
-        if(command.kind=="shipSteal")
-        {
-            if(!HasStealableItems(other))return "对方船舱暂无可掠夺的未锁定物资";
-            var maxLoot=reqAmount;
-            var prefLabel=string.IsNullOrEmpty(command.properties)?"物资":FormatCategoryLabel(command.properties);
-            var loot=new List<ItemProperties>();
-            FleetPhysicalActors.RecordAndSpawn("shipSteal",$"劫掠{prefLabel} ×{maxLoot}",actorPos,otherPos,
-                onArriveTarget:()=>
-                {
-                    loot=ExtractItemsFromShip(other,command.properties,maxLoot);
-                    if(loot.Count<maxLoot&&!string.IsNullOrEmpty(command.properties))
-                        loot.AddRange(ExtractItemsFromShip(other,"",maxLoot-loot.Count));
-                },
-                onReturnHome:()=>
-                {
-                    foreach(var prop in loot)if(prop!=null)actor.SpawnItemToAvailableStorage(prop);
-                    if(loot.Count>0)
-                        FleetPhysicalActors.SpawnNativePopup(actorPos+Vector3.up*2.8f,$"劫掠归航：夺得物资 ×{loot.Count}");
-                });
-            return null;
-        }
-        if(command.kind=="shipAttack")
-        {
-            var otherRoot=FleetEngineBundle.RootFor(other)?.Buildable;
-            var targetBuilding=(clickedBuilding!=null&&clickedBuilding.Community==other&&clickedBuilding!=otherRoot&&!MoveConstructionCommands.IsStored(clickedBuilding))
-                ?clickedBuilding
-                :other.Buildables.FirstOrDefault(b=>b!=null&&b!=otherRoot&&!MoveConstructionCommands.IsStored(b));
-            var hitPos=targetBuilding!=null?targetBuilding.transform.position:otherPos;
-            var bName=targetBuilding?.Name??"船体";
-            FleetPhysicalActors.RecordAndSpawn("shipAttack",$"轰击 {bName}",actorPos,hitPos,onArriveTarget:()=>
-            {
-                if(targetBuilding!=null)
-                {
-                    var nextHealth=Mathf.Max(0f,targetBuilding.Health-0.25f);
-                    AccessTools.PropertySetter(typeof(Buildable),nameof(Buildable.Health)).Invoke(targetBuilding,new object[]{nextHealth});
-                    if(targetBuilding.SpawnedVisual!=null)targetBuilding.SpawnedVisual.SetProgress(nextHealth);
-                    if(nextHealth<=0.05f)targetBuilding.Salvage();
-                    return;
-                }
-                var heartEngine=FleetEngineBundle.HeartBuildable(other)?.GetComponent<Engine>();
-                heartEngine?.EnergyGrid?.RequestStorageEnergy(150f);
-            });
-            return null;
-        }
-        return "未知跨船操作";
+        return string.IsNullOrWhiteSpace(prop.name)?"物资":prop.name;
     }
-    internal static string FormatCategoryLabel(string? selector)=>selector switch
+    internal static string FormatCategoryLabel(string? selector)
     {
-        "Plastic"=>"塑料",
-        "Metal"=>"金属",
-        "Food"=>"食物",
-        "Drink"=>"淡水",
-        "Tech"=>"电子/科技",
-        _=>"木材"
-    };
-    internal static int CountItemsOnShip(Community? from,string? selector)
-    {
-        if(from==null)return 0;
-        var total=0;
-        foreach(var building in from.Buildables)
-        {
-            if(building==null)continue;
-            foreach(var section in building.Inventory.SubInventoryTypes)
-                foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()))
-                    if(item?.Properties!=null&&!item.IsReserved&&MatchesCategory(item.Properties,selector))
-                        total++;
-        }
-        return total;
-    }
-    private static bool MatchesCategory(ItemProperties p,string? selector)
-    {
-        if(string.IsNullOrEmpty(selector))return true;
-        var n=p.name??"";
+        if(string.IsNullOrEmpty(selector))return "物资";
+        var resolved=Resources.FindObjectsOfTypeAll<ItemProperties>().FirstOrDefault(x=>x!=null&&x.name==selector);
+        if(resolved!=null)return CleanItemName(resolved);
         return selector switch
         {
-            "Food"=>(p.Tags&Item.Tags.Food)!=0,
-            "Drink"=>(p.Tags&Item.Tags.Drink)!=0,
-            "Wood"=>n=="DryWood"||n=="WetWood"||n=="Planks"||n.IndexOf("Wood",StringComparison.OrdinalIgnoreCase)>=0,
-            "Plastic"=>n=="Plastic"||n.IndexOf("Plastic",StringComparison.OrdinalIgnoreCase)>=0,
-            "Metal"=>n=="Metal"||n=="ScrapMetal"||n.IndexOf("Metal",StringComparison.OrdinalIgnoreCase)>=0||n.IndexOf("Iron",StringComparison.OrdinalIgnoreCase)>=0,
-            "Tech"=>n=="Electronics"||n.IndexOf("Book",StringComparison.OrdinalIgnoreCase)>=0||n.IndexOf("Tech",StringComparison.OrdinalIgnoreCase)>=0||n.IndexOf("Electro",StringComparison.OrdinalIgnoreCase)>=0,
-            _=>n==selector
+            "Wood"=>"木材",
+            "Plastic"=>"塑料",
+            "Metal"=>"金属",
+            "Food"=>"食物",
+            "Drink"=>"淡水",
+            "Tech"=>"电子/科技",
+            _=>selector!
         };
     }
-    private static bool HasStealableItems(Community from)
+    internal static List<(ItemProperties Prop,int Count)> CollectShipStock(Community? from,Buildable? prioritizeBuilding=null)
     {
-        foreach(var building in from.Buildables)
+        var counts=new Dictionary<string,(ItemProperties Prop,int Count)>(StringComparer.Ordinal);
+        if(from==null)return new List<(ItemProperties,int)>();
+        var ordered=prioritizeBuilding!=null&&prioritizeBuilding.Community==from
+            ?new[]{prioritizeBuilding}.Concat(from.Buildables.Where(b=>b!=prioritizeBuilding))
+            :from.Buildables;
+        foreach(var building in ordered)
         {
-            if(building==null)continue;
+            if(building==null||MoveConstructionCommands.IsStored(building)||building.Inventory==null)continue;
             foreach(var section in building.Inventory.SubInventoryTypes)
-                foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()))
-                    if(item!=null&&!item.IsReserved)return true;
-        }
-        return false;
-    }
-    private static List<ItemProperties> ExtractItemsFromShip(Community from,string selector,int maxCount)
-    {
-        var extracted=new List<ItemProperties>();
-        foreach(var building in from.Buildables)
-        {
-            if(building==null||extracted.Count>=maxCount)break;
-            foreach(var section in building.Inventory.SubInventoryTypes.ToArray())
             {
-                if(extracted.Count>=maxCount)break;
-                foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()).ToArray())
+                if(!IsTradableSection(section))continue;
+                foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()))
                 {
-                    if(extracted.Count>=maxCount)break;
-                    if(item==null||item.IsReserved)continue;
-                    var p=item.Properties;
-                    if(!MatchesCategory(p,selector))continue;
-                    if(building.Inventory.RemoveItem(p,section)!=null)
-                        extracted.Add(p);
+                    var p=item?.Properties;
+                    if(item==null||p==null||item.IsReserved||p.IsQuestItem)continue;
+                    if(counts.TryGetValue(p.name,out var cur))counts[p.name]=(p,cur.Count+1);
+                    else counts[p.name]=(p,1);
                 }
             }
         }
-        return extracted;
+        return counts.Values
+            .OrderByDescending(x=>x.Count)
+            .ThenBy(x=>x.Prop.name,StringComparer.Ordinal)
+            .ToList();
     }
 }

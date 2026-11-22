@@ -131,18 +131,33 @@ test('independent mode configures multi-ship rules while rooms inspect differenc
   const independent = page.getByRole('button', { name: /独立模式/ });
   await expect(independent).toBeEnabled();
   await independent.click();
-  await page.getByLabel('允许攻击玩家').check();
+  await page.getByLabel('允许手动炮战').check();
   await page.getByLabel('昵称', { exact: true }).fill('船长');
   await page.getByRole('button', { name: '创建房间', exact: true }).last().click();
   await expect(page.getByRole('heading', { name: '我的房间' })).toBeVisible();
   await expect(page.getByRole('button', { name: '启动多船世界', exact: true })).toBeVisible();
-  await expect(page.getByText('42 ms')).toBeVisible();
+  await expect(page.getByText('房间已连接 · 游戏尚未启动')).toBeVisible();
+  await expect(page.getByText('42 ms', { exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: /本机与房主的差异/ }).click();
   const drawer = page.getByRole('dialog', { name: '本机与房主的差异' });
   await expect(drawer).toContainText('缺少房主启用的模组：OceanTools');
   await expect(drawer).toContainText('从「模组 → 发现模组」安装，或向房主要同一文件');
   const host = (await calls(page)).find((c) => c.name === 'host_room');
   expect(host?.args).toMatchObject({ mode: 'independent', rules: { stealing: true, sabotage: true, trading: true, friendlyFire: true } });
+});
+
+test('game telemetry distinguishes syncing from lobby latency and preserves a real zero millisecond RTT', async ({ page }) => {
+  await shim(page, `async (name) => {
+    if (name === 'get_snapshot') return ${JSON.stringify(snapshot())};
+    if (name === 'multiplayer_status') return { installed: true, version: '0.5.0', runtime: { phase: 'syncing', status: '等待世界数据', ready: true, replicaReady: false, connected: true, latency: 0 } };
+    if (name === 'room_status') return { connected: true, host: false, mode: 'independent', address: '127.0.0.1:27025', invite: '', members: [], messages: [], error: '', differences: [], latency: 42 };
+    return undefined;
+  }`);
+  await page.goto('/');
+  await page.getByRole('button', { name: '联机', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: '同步房主世界中' })).toBeVisible();
+  await expect(page.getByText('0 ms', { exact: true })).toBeVisible();
+  await expect(page.getByText('42 ms', { exact: true })).toHaveCount(0);
 });
 
 test('shared room installs components before launching the multiplayer command', async ({ page }) => {

@@ -21,11 +21,13 @@
     <Reference Include="UnityEngine.JSONSerializeModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.JSONSerializeModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.Physics2DModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.Physics2DModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.TerrainPhysicsModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.TerrainPhysicsModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.UIModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.UI"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.TextMeshPro"><HintPath>$(GameRoot)\Flotsam_Data\Managed\Unity.TextMeshPro.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.ParticleSystemModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.AudioModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.AudioModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AnimationModule"><HintPath>$(GameRoot)\Flotsam_Data\Managed\UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 </Project>

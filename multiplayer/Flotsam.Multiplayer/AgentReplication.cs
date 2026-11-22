@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using HarmonyLib;
 using PajamaLlama.Fltsm;
@@ -7,20 +8,51 @@ namespace Flotsam.Multiplayer;
 
 internal static class AgentReplication
 {
+    private static readonly Dictionary<int,string> DescriptorBytesCache=new Dictionary<int,string>();
+    private static readonly Dictionary<int,int> DescriptorSendBudget=new Dictionary<int,int>();
+
+    public static void Reset()
+    {
+        DescriptorBytesCache.Clear();
+        DescriptorSendBudget.Clear();
+    }
+
+    public static void InvalidateClientBudgets() => DescriptorSendBudget.Clear();
+
     public static void Capture(Agent agent,AgentState state)
     {
-        state.descriptorId=agent.Descriptor.UniqueID;
-        state.descriptor=Convert.ToBase64String(JsonCodec.EncodeRuntime(agent.Descriptor.GetPersistentData()));
+        var uid=agent.Descriptor.UniqueID;
+        state.descriptorId=uid;
+        if(!DescriptorBytesCache.TryGetValue(uid,out var encoded))
+        {
+            encoded=Convert.ToBase64String(JsonCodec.EncodeRuntime(agent.Descriptor.GetPersistentData()));
+            DescriptorBytesCache[uid]=encoded;
+        }
+        DescriptorSendBudget.TryGetValue(uid,out var sentCount);
+        if(sentCount<12)
+        {
+            state.descriptor=encoded;
+            DescriptorSendBudget[uid]=sentCount+1;
+        }
+        else state.descriptor="";
         state.hunger=agent.Vitals.Hunger.Amount;state.thirst=agent.Vitals.Thirst.Amount;state.pollution=agent.Vitals.Pollution.Level;
         state.assignments=agent.Assignments.Select(a=>new AssignmentState{type=(int)a.Type,priority=(int)a.Priority,enabled=a.Enabled}).ToArray();
+        SpecialistReplication.CaptureAgent(agent,state);
     }
     public static Agent Spawn(AgentState state,Community owner)
     {
         if(state.descriptorId<0||state.descriptorId>ushort.MaxValue||state.descriptor.Length>32768)throw new InvalidOperationException("Invalid drifter descriptor");
         if(!ActorDescriptor.TryGet<AgentDescriptor>(out var descriptor,(ushort)state.descriptorId))
         {
-            var data=(ActorDescriptor.PersistentDataBase)JsonCodec.DecodeRuntime(AccessTools.Inner(typeof(AgentDescriptor),"PersistentData"),Convert.FromBase64String(state.descriptor));
-            descriptor=(AgentDescriptor)data.Restore();
+            if(!string.IsNullOrEmpty(state.descriptor))
+            {
+                var data=(ActorDescriptor.PersistentDataBase)JsonCodec.DecodeRuntime(AccessTools.Inner(typeof(AgentDescriptor),"PersistentData"),Convert.FromBase64String(state.descriptor));
+                descriptor=(AgentDescriptor)data.Restore();
+            }
+            else
+            {
+                descriptor=AgentDescriptor.CreateInstance();
+            }
         }
         return descriptor.Spawn<Agent>(owner??Community.PlayerCommunity,new UnityEngine.Vector3(state.x,state.y,state.z));
     }
@@ -37,5 +69,6 @@ internal static class AgentReplication
             var assignment=agent.Assignments.FirstOrDefault(a=>(int)a.Type==entry.type);if(assignment==null)continue;
             if(assignment.Enabled!=entry.enabled||((int)assignment.Priority)!=entry.priority)agent.SetAssignmentEnabled((AssignmentType)entry.type,entry.enabled,(AssignmentPriority)entry.priority);
         }
+        SpecialistReplication.ApplyAgent(agent,state);
     }
 }

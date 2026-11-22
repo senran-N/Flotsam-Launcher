@@ -30,7 +30,7 @@ interface Room {
 interface Multiplayer {
   installed: boolean;
   version: string;
-  runtime: null | { status: string; ready: boolean; replicaReady: boolean; connected: boolean };
+  runtime: null | { status: string; phase?: string; latency?: number; ready: boolean; replicaReady: boolean; connected: boolean };
 }
 
 const CAPTAIN_NAMES_ZH = ['漂流船长', '海鸥领航员', '灯塔守望者', '拾荒机械师', '远洋舵手', '潮汐船匠'];
@@ -65,6 +65,17 @@ const tutorialDrawer = ref(false);
 
 const installed = computed(() => multiplayer.value?.installed ?? false);
 const gameRunning = computed(() => store.running);
+const gamePhase = computed(() => {
+  const runtime = multiplayer.value?.runtime;
+  if (!runtime) return t('online.phaseNotStarted');
+  const phase = runtime.phase || (runtime.replicaReady ? 'playing' : runtime.ready ? 'syncing' : 'loading');
+  const labels = {
+    starting: 'online.phase.starting', connecting: 'online.phase.connecting', loading: 'online.phase.loading',
+    waiting: 'online.phase.waiting', syncing: 'online.phase.syncing', resyncing: 'online.phase.resyncing', playing: 'online.phase.playing',
+  } as const;
+  return t(labels[phase as keyof typeof labels] || 'online.phase.connecting');
+});
+const gameLatency = computed(() => multiplayer.value?.runtime?.latency ?? 0);
 const activeRules = computed(() => room.value?.rules || rules.value);
 const activeDiffs = computed(() => (room.value?.connected ? room.value.differences : failures.value));
 const syncPort = computed(() => Math.min(65535, Math.max(1024, Number(port.value) || 27025) + 2));
@@ -330,9 +341,9 @@ onUnmounted(() => { disposed = true; clearTimeout(timer); });
             <div class="room-title-line">
               <h2>{{ room.host ? t('online.myRoom') : t('online.joined') }}</h2>
               <span class="mode-badge">{{ room.mode === 'shared' ? t('online.modeShared') : t('online.modeIndependent') }}</span>
-              <span v-if="room.latency" class="ping-badge">{{ t('online.latency', { ms: room.latency }) }}</span>
+              <span v-if="multiplayer?.runtime?.connected" class="ping-badge" :title="t('online.gameLatency')">{{ t('online.latency', { ms: gameLatency }) }}</span>
             </div>
-            <p class="room-sub-line">{{ multiplayer?.runtime?.status || room.address }}</p>
+            <p class="room-sub-line" role="status">{{ gamePhase }}<span v-if="multiplayer?.runtime"> · {{ multiplayer.runtime.status }}</span></p>
           </div>
         </div>
 

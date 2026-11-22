@@ -62,6 +62,7 @@ internal static class LiveNavigation
         {
             Commit(true);_viewOpen=true;ShowCamera(true);
             Activate.Invoke(map,null);
+            map.WorldCameraController.SetRelativePosition(Vector3.zero);
         },()=>GameEventDispatcher.Dispatch(GameEventType.TransitionedToMapView));
         return false;
     }
@@ -78,7 +79,8 @@ internal static class LiveNavigation
             UIManager.SetState(UIState.Normal);
             CameraController.Instance.Camera.enabled=true;
             CameraController.Instance.UICamera.enabled=true;
-            CameraController.Instance.transform.SetPositionAndRotation(Quaternion.Inverse(map.Townheart.transform.rotation)*map.WorldCameraController.RelativePosition,Quaternion.Inverse(map.Townheart.transform.rotation)*map.WorldCameraController.transform.rotation);
+            var localOrigin=Construction.TownheartPosition;
+            CameraController.Instance.transform.SetPositionAndRotation(localOrigin+Quaternion.Inverse(map.Townheart.transform.rotation)*map.WorldCameraController.RelativePosition,Quaternion.Inverse(map.Townheart.transform.rotation)*map.WorldCameraController.transform.rotation);
             AudioManager.DisableMapAudio((AudioClipProperties)AccessTools.Field(typeof(WorldMap),"_closeAudioClip").GetValue(map));
             GameManager.CursorManager.Deactivate();
             GameEventDispatcher.Dispatch(GameEventType.MapDeactivated);
@@ -99,17 +101,17 @@ internal static class LiveNavigation
         if(_map==null||network?.IsClient!=true||(!network.IsCaptain&&Plugin.Options.mode!="independent")||!_viewOpen)return;
         if(Time.realtimeSinceStartup<_nextKeys)return;_nextKeys=Time.realtimeSinceStartup+.1f;
         var physics=(WorldMapTownheartPhycis2D)Physics.GetValue(_map);
-        var keys=FlotsamInputManager.GetMovementInput(physics.RotateLeft,physics.RotateRight,physics.Backward,physics.Forward);
+        var keys=FleetCombat.BlocksInput?Vector2.zero:FlotsamInputManager.GetMovementInput(physics.RotateLeft,physics.RotateRight,physics.Backward,physics.Forward);
         if(keys.sqrMagnitude>.001f){network.Submit(new GameCommand{kind="navigateKeys",x=keys.x,z=keys.y});_keysSent=true;}
         else if(_keysSent){network.Submit(new GameCommand{kind="navigateStop"});_keysSent=false;}
     }
     public static void Commit(bool force=false)
     {
         if(_map==null||Network?.IsHost!=true||!GameSession.Ready())return;
-        if(!force&&Time.realtimeSinceStartup<_nextCommit)return;_nextCommit=Time.realtimeSinceStartup+.25f;
+        if(!force&&_viewOpen&&Time.realtimeSinceStartup<_nextCommit)return;_nextCommit=Time.realtimeSinceStartup+.02f;
         var world=GameManager.WorldManager.World;var position=_map.Townheart.Position;var rotation=_map.Townheart.transform.rotation;
         var distance=(float)Distance.GetValue(_map);
-        if((position-world.TownheartWorldPosition).sqrMagnitude<.0001f&&Quaternion.Angle(rotation,world.TownheartRotation)<.05f)return;
+        if((position-world.TownheartWorldPosition).sqrMagnitude<.000001f&&Quaternion.Angle(rotation,world.TownheartRotation)<.005f)return;
         MovementEvent.DispatchTownheartMove(world.TownheartWorldPosition,position,world.TownheartRotation,rotation,distance);
         Distance.SetValue(_map,0f);
         AccessTools.Field(typeof(WorldMap),"_startPosition").SetValue(_map,position);
@@ -117,6 +119,7 @@ internal static class LiveNavigation
         Community.PlayerCommunity.StopNonInteractableProjects(position,GameSettings.Instance.GameplaySettings.InteractionRadius);
     }
     public static void MouseInput(){_remoteMode=1;_remoteKeys=Vector2.zero;}
+    public static void PlannedInput(){_remoteMode=3;_remoteKeys=Vector2.zero;}
     public static void KeyInput(Vector2 keys)
     {
         _remoteMode=2;_remoteKeys=keys;
@@ -138,6 +141,7 @@ internal static class LiveNavigation
     {
         var physics=__instance;
         if(_map==null||Network?.IsHost!=true)return true;
+        if(FleetCombat.BlocksInput&&Network.IsCaptain&&_remoteMode==0)return false;
         if(Network.IsCaptain&&(_viewOpen||_remoteMode==0))return _viewOpen;
         if(_remoteMode==2)
         {

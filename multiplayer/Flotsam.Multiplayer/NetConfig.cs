@@ -13,6 +13,7 @@ public sealed class Rules
     [OnDeserializing]
     private void Defaults(StreamingContext context)
     {
+        _ = context.Equals(default);
         stealing = true;
         sabotage = true;
         trading = true;
@@ -31,17 +32,31 @@ public sealed class Rules
             case "markerPlace":
             case "researchStart":
             case "researchCancel":
+            case "buildingRepair":
+            case "shipFlare":
+            case "shipAllyRequest":
+            case "shipAllyAccept":
+            case "shipAllyReject":
+            case "shipAllyBreak":
+            case "nextBiomeReady":
                 return true;
             case "shipTransfer":
+            case "shipFloatBarrel":
+            case "shipBarterOffer":
+            case "shipBarterAccept":
+            case "shipBarterCancel":
                 return trading;
             case "shipSteal":
+                return stealing;
             case "buildingMove":
             case "buildingStore":
+            case "roadStore":
+            case "moveBoat":
             case "markerRemove":
             case "markerLimit":
             case "markerSize":
             case "markerFilter":
-                return stealing;
+                return false;
             case "shipAttack":
                 return friendlyFire;
             case "activate":
@@ -51,6 +66,26 @@ public sealed class Rules
             case "cancelupgrade":
             case "assignmentLimit":
             case "rename":
+            case "decoPlace":
+            case "decoRemove":
+            case "decoCancelRemove":
+            case "decoRename":
+            case "energyConnect":
+            case "energyDisconnect":
+            case "storageTag":
+            case "storageItem":
+            case "storageBatch":
+            case "storagePaste":
+            case "aquaActive":
+            case "aquaAddBrood":
+            case "aquaRemoveBrood":
+            case "distThreshold":
+            case "distAmount":
+            case "birdRename":
+            case "birdFree":
+            case "birdHouseFood":
+            case "birdHouseExport":
+            case "birdHouseGroup":
             case "recipeSelect":
             case "recipeIncrease":
             case "recipeDecrease":
@@ -59,7 +94,7 @@ public sealed class Rules
             case "recipeDisableContinuous":
             case "queueCancel":
             case "producerPriority":
-                return sabotage;
+                return false;
             default:
                 return false;
         }
@@ -77,6 +112,7 @@ public sealed class NetConfig
     [DataMember] public bool autoStart;
     [DataMember] public string mode = "shared";
     [DataMember] public string nickname = "";
+    [DataMember] public string ticket = "", admissions = "";
     [DataMember] public string displayMode = "game";
     [DataMember] public bool windowed;
     [DataMember] public Rules rules = new Rules();
@@ -84,11 +120,13 @@ public sealed class NetConfig
     [OnDeserializing]
     private void Defaults(StreamingContext context)
     {
+        _ = context.Equals(default);
         address = "127.0.0.1";
         port = 27027;
         secret = "";
         mode = "shared";
         nickname = "";
+        ticket = admissions = "";
         displayMode = "game";
         windowed = false;
         rules = new Rules();

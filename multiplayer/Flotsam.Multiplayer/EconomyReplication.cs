@@ -93,7 +93,18 @@ internal sealed class EconomyReplication
         Catalog();if(state.progresses.Length>2048||unlocked.Length>2048)throw new InvalidOperationException("Research state exceeds limit");
         var target=owner??Community.PlayerCommunity;
         var isLocalPlayer=ReferenceEquals(target,Community.PlayerCommunity);
-        if(isLocalPlayer)foreach(var key in unlocked)if(_tech.TryGetValue(key,out var node)&&!node.IsUnlocked())node.Unlock();
+        var newlyUnlocked=new List<TechTreeNode>();
+        if(isLocalPlayer)
+        {
+            foreach(var key in unlocked)
+            {
+                if(_tech.TryGetValue(key,out var node)&&!node.IsUnlocked())
+                {
+                    node.Unlock();
+                    newlyUnlocked.Add(node);
+                }
+            }
+        }
         var research=target?.Research;
         if(research==null)return;
         var progresses=new List<CommunityResearch.Research>();var ids=new HashSet<string>();
@@ -107,10 +118,12 @@ internal sealed class EconomyReplication
         var current=progresses.FirstOrDefault(r=>r.Guid==state.current);
         if(state.current.Length!=0&&current==null)throw new InvalidOperationException("Missing current research");
         Set(research,nameof(research.CurrentResearch),current);
-        if(ReferenceEquals(owner??Community.PlayerCommunity,Community.PlayerCommunity))
+        if(isLocalPlayer)
         {
+            foreach(var finishedNode in newlyUnlocked)
+                new ResearchEvent(GameEventType.ResearchFinished,new CommunityResearch.Research(finishedNode,finishedNode.Cost)).Dispatch();
             if(current!=null)new ResearchEvent(previous==state.current?GameEventType.ResearchProgressPointsUpdated:GameEventType.ResearchStarted,current).Dispatch();
-            else if(previousResearch!=null)new ResearchEvent(GameEventType.ResearchCancelled,previousResearch).Dispatch();
+            else if(previousResearch!=null&&!unlocked.Contains(previous))new ResearchEvent(GameEventType.ResearchCancelled,previousResearch).Dispatch();
         }
     }
     public string? ExecuteGlobal(GameCommand command,Community? owner=null)

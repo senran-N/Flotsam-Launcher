@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using HarmonyLib;
 using TMPro;
 using UnityEngine;
@@ -8,58 +9,113 @@ using UnityEngine;
 namespace Flotsam.Multiplayer;
 
 /// <summary>
-/// Spawns and animates genuine 3D in-world actors for cross-ship gameplay:
-/// - 3D Courier Boats with a Drifter captain & 3D cargo crates for Trade
-/// - 3D Raiding Skiffs that board enemy buildings, load stolen crates, and sail back home
-/// - 3D Parabolic Artillery Salvos (3-round cannonballs with smoke trails & impact explosions)
-/// - Native WorldMap miniature ship markers for all ships in the fleet
+/// Spawns and animates genuine 3D in-world and WorldMap actors for multiplayer gameplay:
+/// - Co-op Sea Beacons (3D ocean + WorldMap) for pointing out resources, islands, and hazards
+/// - Authentic WorldMap miniature 3D ships, nameplates, and shared fleet Fog-of-War scouting
 /// </summary>
 internal static class FleetPhysicalActors
 {
-    private sealed class ActiveVoyage
+    internal sealed class ActiveBeacon
     {
-        public string Kind = "";
         public string Label = "";
-        public Vector3 Start;
-        public Vector3 End;
-        public float Speed = 13.5f;
-        public float Progress;
-        public int Phase; // 0 = outbound, 1 = boarding/unloading, 2 = return home
-        public float BoardTimer;
-        public float NextWakeTime;
-        public GameObject? Root;
-        public GameObject? CargoGroup;
-        public Action? OnArriveTarget;
-        public Action? OnReturnHome;
+        public Vector3 ScenePos;
+        public float CreatedAt;
+        public float ExpiresAt;
+        public float NextPulseAt;
+        public GameObject? SceneRoot;
+        public GameObject? MapRoot;
     }
 
-    private sealed class ActiveShell
+    private sealed class WorldMapShipEntry
     {
-        public Vector3 Start;
-        public Vector3 End;
-        public float Delay;
-        public float Elapsed;
-        public float Duration;
-        public float ArcHeight;
-        public bool Launched;
-        public GameObject? Root;
-        public LineRenderer? Trail;
-        public readonly List<Vector3> TrailPoints = new List<Vector3>();
-        public Action? OnImpact;
+        public GameObject Root = null!;
+        public TextMeshPro? Label;
+        public LineRenderer? Ring;
+        public Animator[] Animators = Array.Empty<Animator>();
+        public Vector3 SmoothedPos;
+        public float SmoothedYaw;
+        public bool Initialized;
     }
 
-    private static readonly List<ActiveVoyage> Voyages = new List<ActiveVoyage>();
-    private static readonly List<ActiveShell> Shells = new List<ActiveShell>();
+    private static readonly List<ActiveBeacon> Beacons = new List<ActiveBeacon>();
     private static readonly List<(float expires, FleetActionState state)> OutgoingActions = new List<(float, FleetActionState)>();
     private static readonly HashSet<long> SeenActionIds = new HashSet<long>();
-    private static readonly Dictionary<string, GameObject> WorldMapMarkers = new Dictionary<string, GameObject>(StringComparer.Ordinal);
+    private static readonly Dictionary<string, WorldMapShipEntry> WorldMapShips = new Dictionary<string, WorldMapShipEntry>(StringComparer.Ordinal);
     private static long _nextActionId = 1;
-    private static GameObject? _practiceTargetShip;
     private static Material? _litMat;
     private static Material? _emissiveMat;
+    private static readonly Dictionary<Color,Material> LitMaterials=new Dictionary<Color,Material>();
+    private static readonly Dictionary<Color,Material> EmissiveMaterials=new Dictionary<Color,Material>();
+    private static TMP_FontAsset? _cachedTmpFont;
     private static float _shakeRemaining;
     private static float _shakeIntensity;
+    private static float _nextScoutTime;
     private static readonly Dictionary<string, AudioClip> CachedSfx = new Dictionary<string, AudioClip>(StringComparer.Ordinal);
+
+    internal static (string PeerId, string PlayerName, float ExpiresAt)? PendingCaptainRequest { get; private set; }
+
+    internal static void ClearCaptainRequest() => PendingCaptainRequest = null;
+
+    internal static ActiveBeacon? LatestBeacon
+    {
+        get
+        {
+            var now = Time.realtimeSinceStartup;
+            for (var i = Beacons.Count - 1; i >= 0; i--)
+                if (Beacons[i].ExpiresAt > now) return Beacons[i];
+            return null;
+        }
+    }
+
+    internal static bool IsNearActiveBeacon(Vector3 position, float radius)
+    {
+        var now = Time.realtimeSinceStartup;
+        var rSq = radius * radius;
+        for (var i = 0; i < Beacons.Count; i++)
+        {
+            var b = Beacons[i];
+            if (b.ExpiresAt <= now) continue;
+            var dx = position.x - b.ScenePos.x;
+            var dz = position.z - b.ScenePos.z;
+            if (dx * dx + dz * dz <= rSq) return true;
+        }
+        return false;
+    }
+
+    internal static void Reset()
+    {
+        foreach (var b in Beacons)
+        {
+            if (b.SceneRoot != null) UnityEngine.Object.Destroy(b.SceneRoot);
+            if (b.MapRoot != null) UnityEngine.Object.Destroy(b.MapRoot);
+        }
+        Beacons.Clear();
+        foreach (var kv in WorldMapShips.Values)
+            if (kv.Root != null) UnityEngine.Object.Destroy(kv.Root);
+        WorldMapShips.Clear();
+        OutgoingActions.Clear();
+        SeenActionIds.Clear();
+        PendingCaptainRequest = null;
+        ShipSailingVisuals.Reset();
+    }
+
+    internal static TMP_FontAsset? ResolveNativeTmpFont()
+    {
+        if (_cachedTmpFont != null) return _cachedTmpFont;
+        var allTmp = Resources.FindObjectsOfTypeAll<TextMeshProUGUI>();
+        foreach (var t in allTmp)
+        {
+            if (t != null && t.font != null)
+            {
+                _cachedTmpFont = t.font;
+                return _cachedTmpFont;
+            }
+        }
+        var fonts = Resources.FindObjectsOfTypeAll<TMP_FontAsset>();
+        if (fonts != null && fonts.Length > 0)
+            _cachedTmpFont = fonts.FirstOrDefault(f => f != null);
+        return _cachedTmpFont;
+    }
 
     internal static FleetActionState[] CaptureRecentActions()
     {
@@ -74,14 +130,11 @@ internal static class FleetPhysicalActors
         foreach (var act in actions)
         {
             if (act == null || act.id <= 0 || !SeenActionIds.Add(act.id)) continue;
-            var start = new Vector3(act.startX, 0f, act.startZ);
-            var end = new Vector3(act.endX, 0f, act.endZ);
-            if (act.kind == "shipTransfer")
-                SpawnBoatVoyage("shipTransfer", act.label, start, end, null, null);
-            else if (act.kind == "shipSteal")
-                SpawnBoatVoyage("shipSteal", act.label, start, end, null, null);
-            else if (act.kind == "shipAttack")
-                SpawnCannonSalvo(start, end, null);
+            var start = ClientOceanAnchor.HostToClientPos(new Vector3(act.startX, 0f, act.startZ));
+            var end = act.kind == "seaChartReveal"
+                ? new Vector3(act.endX, 0f, act.endZ)
+                : ClientOceanAnchor.HostToClientPos(new Vector3(act.endX, 0f, act.endZ));
+            DispatchLocalEffect(act.kind, act.label, start, end, act.sourceShip, act.targetShip, act.targetBuilding, act.subKind, null, null);
         }
     }
 
@@ -90,6 +143,10 @@ internal static class FleetPhysicalActors
         string label,
         Vector3 start,
         Vector3 end,
+        string sourceShip = "",
+        string targetShip = "",
+        long targetBuilding = 0,
+        int subKind = 0,
         Action? onArriveTarget = null,
         Action? onReturnHome = null)
     {
@@ -99,377 +156,602 @@ internal static class FleetPhysicalActors
         {
             id = id,
             kind = kind,
+            subKind = subKind,
             label = label,
+            sourceShip = sourceShip,
+            targetShip = targetShip,
+            targetBuilding = targetBuilding,
             startX = start.x,
             startZ = start.z,
             endX = end.x,
             endZ = end.z
         }));
 
-        if (kind == "shipAttack")
-            SpawnCannonSalvo(start, end, onArriveTarget);
-        else
-            SpawnBoatVoyage(kind, label, start, end, onArriveTarget, onReturnHome);
+        DispatchLocalEffect(kind, label, start, end, sourceShip, targetShip, targetBuilding, subKind, onArriveTarget, onReturnHome);
     }
 
-    internal static Vector3 GetOrSpawnPracticeTarget(Vector3 myHeartPos)
-    {
-        var targetPos = myHeartPos + new Vector3(36f, 0f, 32f);
-        if (_practiceTargetShip == null)
-        {
-            _practiceTargetShip = new GameObject("Flotsam_PracticeTargetShip");
-            _practiceTargetShip.transform.position = targetPos;
-            AttachGenuineBoatMesh(_practiceTargetShip.transform, 1.35f);
-            AttachCargoCrates(_practiceTargetShip.transform, true);
-            AttachWorldBanner(_practiceTargetShip.transform, "海上演练靶船", new Color(0.96f, 0.73f, 0.23f));
-            SpawnNativeSplash(targetPos);
-        }
-        else
-        {
-            _practiceTargetShip.transform.position = targetPos;
-        }
-        return targetPos;
-    }
-
-    private static void SpawnBoatVoyage(
+    private static void DispatchLocalEffect(
         string kind,
         string label,
         Vector3 start,
         Vector3 end,
+        string sourceShip,
+        string targetShip,
+        long targetBuilding,
+        int subKind,
         Action? onArriveTarget,
         Action? onReturnHome)
     {
-        var dir = end - start;
-        dir.y = 0f;
-        if (dir.sqrMagnitude < 1f) dir = Vector3.forward * 20f;
-        var launchPos = start + dir.normalized * 5.5f;
-        var targetPos = end - dir.normalized * 4.0f;
-
-        var root = new GameObject($"Flotsam_Voyage_{kind}");
-        root.transform.position = launchPos;
-        root.transform.rotation = Quaternion.LookRotation(dir.normalized, Vector3.up);
-
-        AttachGenuineBoatMesh(root.transform, 1.0f);
-        AttachDrifterCrewVisual(root.transform);
-        var cargo = AttachCargoCrates(root.transform, kind == "shipTransfer");
-
-        var isRaid = kind == "shipSteal";
-        var bannerColor = isRaid ? new Color(0.94f, 0.42f, 0.24f) : new Color(0.96f, 0.73f, 0.23f);
-        var bannerTitle = isRaid ? "登船掠夺艇" : $"运输船 · {label}";
-        AttachWorldBanner(root.transform, bannerTitle, bannerColor);
-
-        SpawnNativeSplash(launchPos);
-        SpawnNativePopup(launchPos + Vector3.up * 2.2f, bannerTitle);
-        PlayFleetSound(isRaid ? "raid_depart" : "boat_depart", launchPos, 0.72f);
-
-        Voyages.Add(new ActiveVoyage
+        if (kind == "cannonImpact")
         {
-            Kind = kind,
-            Label = label,
-            Start = launchPos,
-            End = targetPos,
-            Speed = isRaid ? 15.5f : 13.0f,
-            Root = root,
-            CargoGroup = cargo,
-            OnArriveTarget = onArriveTarget,
-            OnReturnHome = onReturnHome
-        });
+            SpawnNativeSplash(end);SpawnImpactBurst(end,1f);PlayFleetSound("shell_impact",end,.7f);
+            var local=Community.PlayerCommunity;
+            if(local!=null&&sourceShip==Replication.ShipKey(local))SpawnNativePopup(end+Vector3.up*2,label);
+            return;
+        }
+        if (kind == "seaPing")
+        {
+            SpawnSeaBeacon(label, start, sourceShip);
+            return;
+        }
+        if (kind == "seaFlare")
+        {
+            SpawnSeaFlare(label, start, sourceShip);
+            return;
+        }
+        if (kind == "seaChartReveal")
+        {
+            FleetVisibility.ApplyChartRevealIfAuthorized(sourceShip, end.x, end.z, subKind > 0 ? subKind : 1200f);
+            var myKey = Replication.ShipKey(Community.PlayerCommunity);
+            if (Plugin.Options.mode != "independent" || sourceShip == myKey)
+            {
+                Plugin.Instance?.Network?.ShowNotice("🗺️ 旧海图揭开了周边 1200m 海域迷雾！", false);
+                PlayFleetSound("cargo_deliver", Construction.TownheartPosition, 0.78f);
+            }
+            return;
+        }
+        if (kind == "allyRequest" || kind == "allyNotice" || kind == "allyBreak" ||
+            kind == "betrayalNotice" || kind == "barterNotice" || kind == "lootNotice")
+        {
+            var net = Plugin.Instance?.Network;
+            var myKey = Replication.ShipKey(Community.PlayerCommunity);
+            var isErr = kind == "betrayalNotice" || kind == "allyBreak";
+            var relevant = kind == "allyNotice" || kind == "allyBreak" || kind == "betrayalNotice" || kind == "lootNotice" ||
+                           sourceShip == myKey || targetShip == myKey;
+            if (relevant && net != null)
+                net.ShowNotice(label, isErr);
+            var fxColor = kind == "betrayalNotice"
+                ? new Color(1.0f, 0.22f, 0.18f, 0.95f)
+                : kind.StartsWith("ally", StringComparison.Ordinal)
+                    ? new Color(0.28f, 0.90f, 0.85f, 0.92f)
+                    : new Color(0.98f, 0.82f, 0.28f, 0.90f);
+            var ringPos = ResolveEndpoint(targetShip, 0, end);
+            SpawnWaterShockwaveRing(ringPos, fxColor, 6.8f);
+            PlayFleetSound(kind == "betrayalNotice" ? "raid_board" : "cargo_deliver", ringPos, 0.82f);
+            return;
+        }
+        if (kind == "captainRequest")
+        {
+            PendingCaptainRequest = (sourceShip, label, Time.realtimeSinceStartup + 18f);
+            var net = Plugin.Instance?.Network;
+            if (net != null)
+            {
+                if (net.IsCaptain || net.IsHost)
+                    net.ShowNotice($"{label} 请求接管掌舵权 (按 F8 一键移交)", false);
+                else if (net.LocalPeer == sourceShip)
+                    net.ShowNotice("已向当前船长发送掌舵请求", false);
+            }
+            PlayFleetSound("cargo_deliver", Construction.TownheartPosition, 0.65f);
+            return;
+        }
     }
 
-    private static void SpawnCannonSalvo(Vector3 start, Vector3 end, Action? onFinalImpact)
+    internal static void RebaseAnchor(Vector3 oldPos, Quaternion oldRot, Vector3 newPos, Quaternion newRot)
     {
-        var dir = end - start;
-        dir.y = 0f;
-        if (dir.sqrMagnitude < 1f) dir = Vector3.forward * 25f;
-        var dist = dir.magnitude;
-        var duration = Mathf.Clamp(dist / 36f, 0.65f, 1.75f);
-        var arc = Mathf.Clamp(dist * 0.26f, 7.5f, 22f);
-
-        SpawnNativePopup(start + Vector3.up * 3.5f, "船首火炮齐射");
-
-        for (var i = 0; i < 3; i++)
+        var inv = Quaternion.Inverse(newRot);
+        Vector3 Rebase(Vector3 p)
         {
-            var spread = new Vector3(UnityEngine.Random.Range(-1.2f, 1.2f), 0f, UnityEngine.Random.Range(-1.2f, 1.2f));
-            var shellStart = start + Vector3.up * 2.4f + dir.normalized * 2.5f;
-            var shellEnd = end + Vector3.up * 1.0f + (i == 2 ? Vector3.zero : spread);
-
-            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-            go.name = $"Flotsam_CannonShell_{i}";
-            var col = go.GetComponent<Collider>();
-            if (col != null) UnityEngine.Object.Destroy(col);
-            go.transform.localScale = Vector3.one * 0.52f;
-            go.transform.position = shellStart;
-            var r = go.GetComponent<Renderer>();
-            if (r != null) r.sharedMaterial = GetEmissiveMaterial(new Color(1f, 0.48f, 0.12f));
-
-            var trail = go.AddComponent<LineRenderer>();
-            trail.material = GetEmissiveMaterial(new Color(0.95f, 0.65f, 0.25f, 0.85f));
-            trail.startWidth = 0.26f;
-            trail.endWidth = 0.04f;
-            trail.positionCount = 0;
-            trail.useWorldSpace = true;
-
-            go.SetActive(false);
-            Shells.Add(new ActiveShell
-            {
-                Start = shellStart,
-                End = shellEnd,
-                Delay = i * 0.22f,
-                Duration = duration,
-                ArcHeight = arc + i * 1.4f,
-                Root = go,
-                Trail = trail,
-                OnImpact = i == 2 ? onFinalImpact : null
-            });
+            var canonical = oldPos + oldRot * p;
+            var r = inv * (canonical - newPos);
+            r.y = p.y;
+            return r;
         }
+
+        foreach (var b in Beacons)
+        {
+            b.ScenePos = Rebase(b.ScenePos);
+            if (b.SceneRoot != null) b.SceneRoot.transform.position = b.ScenePos;
+        }
+    }
+
+    private static Vector3 ResolveEndpoint(string shipName, long buildingId, Vector3 fallback)
+    {
+        var net = Plugin.Instance?.Network;
+        if (buildingId > 0 && net != null)
+        {
+            var b = net.ResolveBuilding(buildingId);
+            if (b != null && !MoveConstructionCommands.IsStored(b))
+                return new Vector3(b.transform.position.x, 0f, b.transform.position.z);
+        }
+        if (!string.IsNullOrEmpty(shipName))
+        {
+            var comm = Replication.ResolveCommunity(shipName);
+            if (comm != null)
+            {
+                var heart = FleetEngineBundle.HeartBuildable(comm)
+                            ?? comm.Buildables.FirstOrDefault(x => x != null && !MoveConstructionCommands.IsStored(x) && (x.TryGetComponent<TownheartStorage>(out _) || x.TryGetComponent<Engine>(out _)))
+                            ?? comm.Buildables.FirstOrDefault(x => x != null && !MoveConstructionCommands.IsStored(x));
+                if (heart != null)
+                    return new Vector3(heart.transform.position.x, 0f, heart.transform.position.z);
+            }
+            var shipState = net?.Ships.FirstOrDefault(s => s != null && s.name == shipName);
+            if (shipState != null)
+                return new Vector3(shipState.x, 0f, shipState.z);
+        }
+        return fallback;
+    }
+
+    private static void SpawnSeaFlare(string label, Vector3 scenePos, string senderShipKey)
+    {
+        var pos = new Vector3(scenePos.x, 0.2f, scenePos.z);
+        var root = new GameObject("Flotsam_SeaFlare");
+        root.transform.position = pos;
+
+        var flareCol = new Color(1.0f, 0.34f, 0.16f, 0.96f);
+
+        var beamGo = new GameObject("FlareColumn");
+        beamGo.transform.SetParent(root.transform, false);
+        var beam = beamGo.AddComponent<LineRenderer>();
+        beam.useWorldSpace = false;
+        beam.material = GetEmissiveMaterial(new Color(1.0f, 0.42f, 0.18f, 0.92f));
+        beam.startWidth = 0.65f;
+        beam.endWidth = 0.12f;
+        beam.positionCount = 2;
+        beam.SetPosition(0, Vector3.zero);
+        beam.SetPosition(1, new Vector3(0f, 38f, 0f));
+
+        var star = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        star.transform.SetParent(root.transform, false);
+        star.transform.localPosition = new Vector3(0f, 38f, 0f);
+        star.transform.localScale = Vector3.one * 1.45f;
+        if (star.TryGetComponent<Collider>(out var c)) UnityEngine.Object.Destroy(c);
+        star.GetComponent<Renderer>().sharedMaterial = GetEmissiveMaterial(new Color(1.0f, 0.78f, 0.25f));
+
+        AttachWorldBanner(root.transform, $"🚨 信号弹 · {label}", new Color(1.0f, 0.58f, 0.24f), 5.6f);
+        SpawnWaterShockwaveRing(pos, flareCol, 12.5f);
+        PlayFleetSound("cannon_fire", pos, 0.92f);
+
+        GameObject? mapRoot = null;
+        var map = GameManager.WorldMapManager?.WorldMap;
+        if (map?.Townheart != null && map.Townheart.transform.parent != null)
+        {
+            mapRoot = new GameObject("WorldMap_SeaFlare");
+            mapRoot.transform.SetParent(map.Townheart.transform.parent, false);
+            mapRoot.layer = map.Townheart.gameObject.layer;
+            var mapPos = FleetOwnedNavigation.SceneToMap(ClientOceanAnchor.ClientToHostPos(pos));
+            mapRoot.transform.position = new Vector3(mapPos.x, map.Townheart.transform.position.y + 0.6f, mapPos.z);
+
+            var mapRing = mapRoot.AddComponent<LineRenderer>();
+            mapRing.useWorldSpace = false;
+            mapRing.loop = true;
+            mapRing.material = GetEmissiveMaterial(flareCol);
+            mapRing.startWidth = 1.6f;
+            mapRing.endWidth = 1.6f;
+            mapRing.positionCount = 28;
+            for (var i = 0; i < 28; i++)
+            {
+                var ang = i * Mathf.PI * 2f / 28;
+                mapRing.SetPosition(i, new Vector3(Mathf.Cos(ang) * 14f, 0.25f, Mathf.Sin(ang) * 14f));
+            }
+            AttachWorldBanner(mapRoot.transform, $"🚨 {label}", new Color(1.0f, 0.58f, 0.24f), 8.5f, mapRoot.layer, 28f);
+            mapRoot.SetActive(LiveNavigation.ViewOpen);
+        }
+
+        var now = Time.realtimeSinceStartup;
+        Beacons.Add(new ActiveBeacon
+        {
+            Label = label,
+            ScenePos = pos,
+            CreatedAt = now,
+            ExpiresAt = now + 35f,
+            NextPulseAt = now + 1.4f,
+            SceneRoot = root,
+            MapRoot = mapRoot
+        });
+
+        var myKey = Replication.ShipKey(Community.PlayerCommunity);
+        Plugin.Instance?.Network?.ShowNotice(
+            senderShipKey == myKey ? "🚨 已发射全图信号弹，周边海域已对所有船长暴露 35 秒！" : $"🚨 远海升起信号弹：{label} (按 M 海图或 F9 查看)",
+            false);
+    }
+
+    private static void SpawnSeaBeacon(string label, Vector3 scenePos, string senderPeerId)
+    {
+        var pos = new Vector3(scenePos.x, 0.15f, scenePos.z);
+        var root = new GameObject("Flotsam_SeaBeacon");
+        root.transform.position = pos;
+
+        var accent = new Color(0.32f, 0.88f, 0.72f, 0.95f);
+
+        // Vertical light column
+        var beamGo = new GameObject("BeaconBeam");
+        beamGo.transform.SetParent(root.transform, false);
+        var beam = beamGo.AddComponent<LineRenderer>();
+        beam.useWorldSpace = false;
+        beam.material = GetEmissiveMaterial(new Color(0.35f, 0.92f, 0.76f, 0.78f));
+        beam.startWidth = 0.42f;
+        beam.endWidth = 0.05f;
+        beam.positionCount = 2;
+        beam.SetPosition(0, Vector3.zero);
+        beam.SetPosition(1, new Vector3(0f, 18f, 0f));
+
+        // Base ring on water
+        var ringGo = new GameObject("BeaconBaseRing");
+        ringGo.transform.SetParent(root.transform, false);
+        var ring = ringGo.AddComponent<LineRenderer>();
+        ring.useWorldSpace = false;
+        ring.loop = true;
+        ring.material = GetEmissiveMaterial(accent);
+        ring.startWidth = 0.24f;
+        ring.endWidth = 0.24f;
+        const int segs = 32;
+        ring.positionCount = segs;
+        for (var i = 0; i < segs; i++)
+        {
+            var ang = i * Mathf.PI * 2f / segs;
+            ring.SetPosition(i, new Vector3(Mathf.Cos(ang) * 2.6f, 0.08f, Mathf.Sin(ang) * 2.6f));
+        }
+
+        AttachWorldBanner(root.transform, $"信标 · {label}", new Color(0.98f, 0.84f, 0.32f), 4.2f);
+        SpawnWaterShockwaveRing(pos, accent, 7.5f);
+        PlayFleetSound("cargo_deliver", pos, 0.80f);
+
+        // Optional WorldMap beacon marker
+        GameObject? mapRoot = null;
+        var map = GameManager.WorldMapManager?.WorldMap;
+        if (map?.Townheart != null && map.Townheart.transform.parent != null)
+        {
+            mapRoot = new GameObject("WorldMap_SeaBeacon");
+            mapRoot.transform.SetParent(map.Townheart.transform.parent, false);
+            mapRoot.layer = map.Townheart.gameObject.layer;
+            var mapPos = FleetOwnedNavigation.SceneToMap(ClientOceanAnchor.ClientToHostPos(pos));
+            mapRoot.transform.position = new Vector3(mapPos.x, map.Townheart.transform.position.y + 0.5f, mapPos.z);
+
+            var mapRing = mapRoot.AddComponent<LineRenderer>();
+            mapRing.useWorldSpace = false;
+            mapRing.loop = true;
+            mapRing.material = GetEmissiveMaterial(new Color(0.98f, 0.80f, 0.24f, 0.95f));
+            mapRing.startWidth = 1.2f;
+            mapRing.endWidth = 1.2f;
+            mapRing.positionCount = 24;
+            for (var i = 0; i < 24; i++)
+            {
+                var ang = i * Mathf.PI * 2f / 24;
+                mapRing.SetPosition(i, new Vector3(Mathf.Cos(ang) * 8f, 0.2f, Mathf.Sin(ang) * 8f));
+            }
+            AttachWorldBanner(mapRoot.transform, $"信标 · {label}", new Color(0.98f, 0.84f, 0.32f), 6.5f, mapRoot.layer, 26f);
+            mapRoot.SetActive(LiveNavigation.ViewOpen);
+        }
+
+        var now = Time.realtimeSinceStartup;
+        Beacons.Add(new ActiveBeacon
+        {
+            Label = label,
+            ScenePos = pos,
+            CreatedAt = now,
+            ExpiresAt = now + 16f,
+            NextPulseAt = now + 1.6f,
+            SceneRoot = root,
+            MapRoot = mapRoot
+        });
+
+        var net = Plugin.Instance?.Network;
+        if (net != null && net.LocalPeer != senderPeerId)
+            net.ShowNotice($"收到海域信标：{label} (按 F9 跳转镜头)", false);
     }
 
     internal static void Tick(float dt)
     {
         if (dt <= 0f || dt > 0.5f) return;
+        var uTime = Time.unscaledTime;
 
-        // 1. Update active 3D boat voyages
-        for (var i = Voyages.Count - 1; i >= 0; i--)
+        if (PendingCaptainRequest.HasValue && Time.realtimeSinceStartup > PendingCaptainRequest.Value.ExpiresAt)
+            PendingCaptainRequest = null;
+
+        // 3. Update active Co-op Sea Beacons & Flares
+        var now = Time.realtimeSinceStartup;
+        var mapOpen = LiveNavigation.ViewOpen;
+        var map = GameManager.WorldMapManager?.WorldMap;
+        for (var i = Beacons.Count - 1; i >= 0; i--)
         {
-            var v = Voyages[i];
-            if (v.Root == null) { Voyages.RemoveAt(i); continue; }
-
-            if (v.Phase == 0)
+            var b = Beacons[i];
+            if (now >= b.ExpiresAt)
             {
-                var dist = Mathf.Max(1f, Vector3.Distance(v.Start, v.End));
-                v.Progress += (v.Speed * dt) / dist;
-                var pos = Vector3.Lerp(v.Start, v.End, Mathf.Clamp01(v.Progress));
-                pos.y = Mathf.Sin(Time.time * 4.2f + i) * 0.14f;
-                v.Root.transform.position = pos;
-
-                var heading = (v.End - v.Start).normalized;
-                if (heading.sqrMagnitude > 0.001f)
-                {
-                    var waveRoll = Quaternion.Euler(Mathf.Sin(Time.time * 3.5f) * 3.2f, 0f, Mathf.Cos(Time.time * 2.8f) * 4.0f);
-                    v.Root.transform.rotation = Quaternion.LookRotation(heading, Vector3.up) * waveRoll;
-                }
-
-                if (Time.time >= v.NextWakeTime)
-                {
-                    v.NextWakeTime = Time.time + 0.35f;
-                    SpawnNativeSplash(pos - heading * 1.6f);
-                }
-
-                if (v.Progress >= 1f)
-                {
-                    v.Progress = 0f;
-                    v.Phase = 1;
-                    v.BoardTimer = v.Kind == "shipSteal" ? 1.8f : 0.7f;
-                    SpawnNativeSplash(v.End);
-                    SpawnWaterShockwaveRing(v.End, v.Kind == "shipSteal" ? new Color(0.95f, 0.42f, 0.24f) : new Color(0.35f, 0.88f, 0.68f), 3.4f);
-                    PlayFleetSound(v.Kind == "shipSteal" ? "raid_board" : "cargo_deliver", v.End, 0.85f);
-                    try { v.OnArriveTarget?.Invoke(); } catch { }
-                    if (v.Kind == "shipSteal")
-                    {
-                        if (v.CargoGroup != null) v.CargoGroup.SetActive(true);
-                        SpawnNativePopup(v.End + Vector3.up * 2.6f, $"登船搜刮: {v.Label}");
-                    }
-                    else
-                    {
-                        if (v.CargoGroup != null) v.CargoGroup.SetActive(false);
-                        SpawnNativePopup(v.End + Vector3.up * 2.6f, $"物资送达: {v.Label}");
-                    }
-                }
+                if (b.SceneRoot != null) UnityEngine.Object.Destroy(b.SceneRoot);
+                if (b.MapRoot != null) UnityEngine.Object.Destroy(b.MapRoot);
+                Beacons.RemoveAt(i);
+                continue;
             }
-            else if (v.Phase == 1)
+            if (now >= b.NextPulseAt)
             {
-                v.BoardTimer -= dt;
-                var pos = v.End;
-                pos.y = Mathf.Sin(Time.time * 5.5f) * 0.18f;
-                v.Root.transform.position = pos;
-                if (v.BoardTimer <= 0f)
+                b.NextPulseAt = now + 2.0f;
+                SpawnWaterShockwaveRing(b.ScenePos, new Color(0.32f, 0.88f, 0.72f, 0.85f), 6.2f);
+            }
+            if (b.MapRoot != null && map?.Townheart != null)
+            {
+                var mapPos = FleetOwnedNavigation.SceneToMap(ClientOceanAnchor.ClientToHostPos(b.ScenePos));
+                b.MapRoot.transform.position = new Vector3(mapPos.x, map.Townheart.transform.position.y + 0.5f, mapPos.z);
+                if (b.MapRoot.activeSelf != mapOpen)
+                    b.MapRoot.SetActive(mapOpen);
+            }
+        }
+
+        // 4. Apply damped camera shake when cannons fire or impact nearby
+        UpdateCameraShake(dt);
+
+        // 5. Sync WorldMap miniature ships & per-ship Fog-of-War scouting
+        SyncWorldMapShipsAndScouting(dt);
+
+        // 6. Enforce 3D renderer culling for unspotted ships in independent mode
+        FleetVisibility.Tick3DVisibility();
+
+        // 7. Render 3D bow waves, ocean-anchored stern wakes & course indicator for moving ships
+        ShipSailingVisuals.Tick(dt);
+    }
+
+    internal static void PanWorldMapTo(float mapX, float mapZ)
+    {
+        var map = GameManager.WorldMapManager?.WorldMap;
+        if (map == null || map.Townheart == null) return;
+        if (!LiveNavigation.ViewOpen)
+            map.Open();
+        var heartPos = map.Townheart.transform.position;
+        map.WorldCameraController.SetRelativePosition(new Vector3(mapX - heartPos.x, 0f, mapZ - heartPos.z));
+    }
+
+    private static void SyncWorldMapShipsAndScouting(float dt)
+    {
+        var map = GameManager.WorldMapManager?.WorldMap;
+        var net = Plugin.Instance?.Network;
+        if (map == null || map.Townheart == null || net == null || !GameSession.Ready()) return;
+
+        var ships = net.Ships;
+        if (ships == null || ships.Length == 0) return;
+
+        // Per-ship Fog-of-War & Tile Discovery (~2.5 Hz, sharing only with allies / active flares)
+        if (Time.unscaledTime >= _nextScoutTime)
+        {
+            _nextScoutTime = Time.unscaledTime + 0.4f;
+            FleetVisibility.ScoutAuthorizedFogOfWar(map, ships);
+        }
+
+        if (Plugin.Options.mode != "independent") return;
+
+        var localKey = Replication.ShipKey(Community.PlayerCommunity);
+        var localShip = ships.FirstOrDefault(s => s != null && s.name == localKey);
+        var nowPlay = GameManager.TimeManager != null ? GameManager.TimeManager.CurrentPlayTime : 0f;
+        var activeNames = new HashSet<string>(StringComparer.Ordinal);
+        var mapVisible = LiveNavigation.ViewOpen;
+        var lerpFactor = 1f - Mathf.Exp(-14f * Mathf.Max(0.001f, dt));
+
+        foreach (var ship in ships)
+        {
+            if (ship == null || string.IsNullOrEmpty(ship.name) || ship.name == localKey) continue;
+            if (!Replication.Finite(ship.mapX) || !Replication.Finite(ship.mapZ)) continue;
+            activeNames.Add(ship.name);
+
+            if (!WorldMapShips.TryGetValue(ship.name, out var entry) || entry.Root == null)
+            {
+                entry = CreateWorldMapShipMarker(map, ship.ownerName);
+                WorldMapShips[ship.name] = entry;
+            }
+
+            var visible = FleetVisibility.IsShipVisibleToLocal(ship, ships);
+            if (visible)
+            {
+                FleetVisibility.RecordSpottedGhost(ship);
+                var targetPos = new Vector3(ship.mapX, map.Townheart.transform.position.y, ship.mapZ);
+                var prevPos = entry.SmoothedPos;
+                if (!entry.Initialized || (targetPos - entry.SmoothedPos).sqrMagnitude > 2500f)
                 {
-                    v.Phase = 2;
-                    v.Progress = 0f;
+                    entry.SmoothedPos = targetPos;
+                    entry.SmoothedYaw = ship.mapRotation;
+                    entry.Initialized = true;
                 }
+                else
+                {
+                    entry.SmoothedPos = Vector3.Lerp(entry.SmoothedPos, targetPos, lerpFactor);
+                    entry.SmoothedYaw = Mathf.LerpAngle(entry.SmoothedYaw, ship.mapRotation, lerpFactor);
+                }
+
+                var moving = (targetPos - prevPos).sqrMagnitude > 0.002f;
+                SetMarkerMoving(entry, moving);
+
+                entry.Root.transform.position = entry.SmoothedPos;
+                entry.Root.transform.rotation = Quaternion.Euler(0f, entry.SmoothedYaw, 0f);
+
+                var allied = FleetVisibility.AreAlliedState(localShip, ship);
+                var flared = ship.flareUntil > nowPlay;
+                if (entry.Label != null)
+                {
+                    entry.Label.text = flared
+                        ? $"🚨 {ship.ownerName} (信号弹)"
+                        : allied
+                            ? $"🤝 {ship.ownerName}"
+                            : $"⚓ {ship.ownerName}";
+                    entry.Label.color = flared
+                        ? new Color(1.0f, 0.56f, 0.24f)
+                        : allied
+                            ? new Color(0.45f, 0.96f, 0.88f)
+                            : new Color(1.0f, 0.94f, 0.72f);
+                }
+                if (entry.Ring != null)
+                {
+                    var rc = flared
+                        ? new Color(1.0f, 0.36f, 0.18f, 0.95f)
+                        : allied
+                            ? new Color(0.28f, 0.92f, 0.86f, 0.95f)
+                            : new Color(0.95f, 0.78f, 0.28f, 0.90f);
+                    entry.Ring.startColor = rc;
+                    entry.Ring.endColor = rc;
+                }
+                if (entry.Root.activeSelf != mapVisible)
+                    entry.Root.SetActive(mapVisible);
+            }
+            else if (FleetVisibility.TryGetGhost(ship.name, out var ghost))
+            {
+                SetMarkerMoving(entry, false);
+                var ghostPos = new Vector3(ghost.MapX, map.Townheart.transform.position.y, ghost.MapZ);
+                entry.Root.transform.position = ghostPos;
+                if (entry.Label != null)
+                {
+                    entry.Label.text = $"👻 最后目击 · {ghost.OwnerName}";
+                    entry.Label.color = new Color(0.76f, 0.74f, 0.68f, 0.88f);
+                }
+                if (entry.Ring != null)
+                {
+                    var gc = new Color(0.65f, 0.62f, 0.56f, 0.55f);
+                    entry.Ring.startColor = gc;
+                    entry.Ring.endColor = gc;
+                }
+                if (entry.Root.activeSelf != mapVisible)
+                    entry.Root.SetActive(mapVisible);
             }
             else
             {
-                var dist = Mathf.Max(1f, Vector3.Distance(v.End, v.Start));
-                v.Progress += (v.Speed * dt) / dist;
-                var pos = Vector3.Lerp(v.End, v.Start, Mathf.Clamp01(v.Progress));
-                pos.y = Mathf.Sin(Time.time * 4.2f + i) * 0.14f;
-                v.Root.transform.position = pos;
-
-                var heading = (v.Start - v.End).normalized;
-                if (heading.sqrMagnitude > 0.001f)
-                    v.Root.transform.rotation = Quaternion.LookRotation(heading, Vector3.up);
-
-                if (Time.time >= v.NextWakeTime)
-                {
-                    v.NextWakeTime = Time.time + 0.38f;
-                    SpawnNativeSplash(pos - heading * 1.6f);
-                }
-
-                if (v.Progress >= 1f)
-                {
-                    SpawnNativeSplash(v.Start);
-                    try { v.OnReturnHome?.Invoke(); } catch { }
-                    if (v.Kind == "shipSteal")
-                        SpawnNativePopup(v.Start + Vector3.up * 2.5f, "掠夺艇满载返航");
-                    UnityEngine.Object.Destroy(v.Root);
-                    Voyages.RemoveAt(i);
-                }
+                if (entry.Root.activeSelf)
+                    entry.Root.SetActive(false);
             }
         }
 
-        // 2. Update active 3D artillery shells
-        for (var i = Shells.Count - 1; i >= 0; i--)
+        foreach (var kv in WorldMapShips.ToArray())
         {
-            var s = Shells[i];
-            if (s.Root == null) { Shells.RemoveAt(i); continue; }
-            if (s.Delay > 0f)
+            if (!activeNames.Contains(kv.Key))
             {
-                s.Delay -= dt;
-                continue;
-            }
-            if (!s.Launched)
-            {
-                s.Launched = true;
-                s.Root.SetActive(true);
-                SpawnNativeSplash(s.Start);
-                SpawnImpactBurst(s.Start, 0.55f);
-                PlayFleetSound("cannon_fire", s.Start, 0.88f);
-                TriggerCameraShake(s.Start, 0.22f, 0.18f);
-            }
-            s.Elapsed += dt;
-            var t = Mathf.Clamp01(s.Elapsed / Mathf.Max(0.1f, s.Duration));
-            var pos = Vector3.Lerp(s.Start, s.End, t);
-            pos.y += 4f * s.ArcHeight * t * (1f - t);
-            s.Root.transform.position = pos;
-
-            if (s.Trail != null)
-            {
-                s.TrailPoints.Add(pos);
-                if (s.TrailPoints.Count > 14) s.TrailPoints.RemoveAt(0);
-                s.Trail.positionCount = s.TrailPoints.Count;
-                for (var p = 0; p < s.TrailPoints.Count; p++)
-                    s.Trail.SetPosition(p, s.TrailPoints[p]);
-            }
-
-            if (t >= 1f)
-            {
-                SpawnNativeSplash(s.End);
-                SpawnImpactBurst(s.End, 1.35f);
-                SpawnWaterShockwaveRing(s.End, new Color(1f, 0.55f, 0.18f), 4.6f);
-                PlayFleetSound("shell_impact", s.End, 0.95f);
-                TriggerCameraShake(s.End, 0.42f, 0.30f);
-                if (s.OnImpact != null)
-                {
-                    try { s.OnImpact.Invoke(); } catch { }
-                    SpawnNativePopup(s.End + Vector3.up * 2.8f, "火炮命中 · 耐久受损 -25%");
-                }
-                UnityEngine.Object.Destroy(s.Root);
-                Shells.RemoveAt(i);
+                if (kv.Value.Root != null) UnityEngine.Object.Destroy(kv.Value.Root);
+                WorldMapShips.Remove(kv.Key);
             }
         }
-
-        // 3. Apply damped camera shake when cannons fire or impact nearby
-        UpdateCameraShake(dt);
-
-        // 4. Sync WorldMap miniature ships when WorldMap is open
-        SyncWorldMapShips();
     }
 
-    private static void SyncWorldMapShips()
+    private static void SetMarkerMoving(WorldMapShipEntry entry, bool moving)
     {
-        try
+        for (var i = 0; i < entry.Animators.Length; i++)
         {
-            var map = GameManager.WorldMapManager?.WorldMap;
-            var net = Plugin.Instance?.Network;
-            if (map == null || map.Townheart == null || net == null || Plugin.Options.mode != "independent") return;
-            var ships = net.Ships;
-            var localName = Community.PlayerCommunity?.Name ?? "";
-            var activeNames = new HashSet<string>(StringComparer.Ordinal);
-
-            foreach (var ship in ships)
+            var anim = entry.Animators[i];
+            if (anim == null || !anim.isActiveAndEnabled || anim.runtimeAnimatorController == null) continue;
+            foreach (var p in anim.parameters)
             {
-                if (ship == null || string.IsNullOrEmpty(ship.name) || ship.name == localName) continue;
-                activeNames.Add(ship.name);
-                if (!WorldMapMarkers.TryGetValue(ship.name, out var marker) || marker == null)
+                if (p.type == AnimatorControllerParameterType.Bool && p.name == "IsMoving")
                 {
-                    marker = CreateWorldMapShipMarker(map, ship.ownerName);
-                    WorldMapMarkers[ship.name] = marker;
-                }
-                var mapX = Replication.Finite(ship.mapX) && (Mathf.Abs(ship.mapX) > 0.01f || Mathf.Abs(ship.mapZ) > 0.01f) ? ship.mapX : ship.x;
-                var mapZ = Replication.Finite(ship.mapZ) && (Mathf.Abs(ship.mapX) > 0.01f || Mathf.Abs(ship.mapZ) > 0.01f) ? ship.mapZ : ship.z;
-                marker.transform.position = new Vector3(mapX, map.Townheart.transform.position.y, mapZ);
-                marker.transform.rotation = Quaternion.Euler(0f, ship.mapRotation, 0f);
-                if (marker.activeSelf != LiveNavigation.ViewOpen)
-                    marker.SetActive(LiveNavigation.ViewOpen);
-            }
-
-            foreach (var kv in WorldMapMarkers.ToArray())
-            {
-                if (!activeNames.Contains(kv.Key))
-                {
-                    if (kv.Value != null) UnityEngine.Object.Destroy(kv.Value);
-                    WorldMapMarkers.Remove(kv.Key);
+                    anim.SetBool("IsMoving", moving);
+                    break;
                 }
             }
         }
-        catch { }
     }
 
-    private static GameObject CreateWorldMapShipMarker(WorldMap map, string ownerName)
+    private static WorldMapShipEntry CreateWorldMapShipMarker(WorldMap map, string ownerName)
     {
         var root = new GameObject($"WorldMap_FleetShip_{ownerName}");
         root.transform.SetParent(map.Townheart.transform.parent, false);
         root.layer = map.Townheart.gameObject.layer;
 
+        var clonedMesh = false;
         var visuals = AccessTools.Field(typeof(WorldMapTownheart), "_visuals")?.GetValue(map.Townheart) as Array;
-        if (visuals != null && visuals.Length > 0 && visuals.GetValue(0) is Component firstVis && firstVis != null)
+        if (visuals != null && visuals.Length > 0)
         {
-            var clone = UnityEngine.Object.Instantiate(firstVis.gameObject, root.transform, false);
-            clone.transform.localPosition = Vector3.zero;
-            clone.SetActive(true);
-        }
-        else
-        {
-            var hull = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            hull.transform.SetParent(root.transform, false);
-            hull.transform.localScale = new Vector3(1.5f, 0.8f, 2.8f);
-            hull.layer = root.layer;
-        }
-        return root;
-    }
-
-    private static void AttachGenuineBoatMesh(Transform parent, float scale)
-    {
-        try
-        {
-            var boats = GameSettings.Instance?.BoatSettings?.Boats;
-            if (boats != null)
+            for (var i = 0; i < visuals.Length; i++)
             {
-                foreach (var boat in boats)
+                var visStruct = visuals.GetValue(i);
+                if (visStruct == null) continue;
+                var visGo = AccessTools.Field(visStruct.GetType(), "GameObject")?.GetValue(visStruct) as GameObject;
+                if (visGo != null)
                 {
-                    if (boat != null && boat.gameObject != null)
-                    {
-                        var clone = UnityEngine.Object.Instantiate(boat.gameObject, parent, false);
-                        clone.transform.localPosition = Vector3.zero;
-                        clone.transform.localRotation = Quaternion.identity;
-                        clone.transform.localScale = Vector3.one * scale;
-                        StripInteractiveComponents(clone);
-                        clone.SetActive(true);
-                        return;
-                    }
+                    var clone = UnityEngine.Object.Instantiate(visGo, root.transform, false);
+                    clone.transform.localPosition = Vector3.zero;
+                    clone.transform.localRotation = Quaternion.identity;
+                    SetLayerRecursively(clone, root.layer);
+                    clone.SetActive(true);
+                    clonedMesh = true;
+                    break;
                 }
             }
         }
-        catch { }
 
-        // Fallback procedural wooden skiff if boat prefab isn't loaded yet
+        if (!clonedMesh)
+            AttachGenuineBoatMesh(root.transform, 3.2f, root.layer);
+
+        // Sea-chart locator ring around the miniature ship so it stands out at wide zoom
+        var ringGo = new GameObject("MapShipRing");
+        ringGo.transform.SetParent(root.transform, false);
+        ringGo.layer = root.layer;
+        var ring = ringGo.AddComponent<LineRenderer>();
+        ring.useWorldSpace = false;
+        ring.loop = true;
+        ring.material = GetEmissiveMaterial(new Color(0.28f, 0.86f, 0.68f, 0.92f));
+        ring.startWidth = 1.1f;
+        ring.endWidth = 1.1f;
+        const int segs = 28;
+        ring.positionCount = segs;
+        for (var i = 0; i < segs; i++)
+        {
+            var ang = i * Mathf.PI * 2f / segs;
+            ring.SetPosition(i, new Vector3(Mathf.Cos(ang) * 10.5f, 0.35f, Mathf.Sin(ang) * 10.5f));
+        }
+
+        var label = AttachWorldBanner(root.transform, $"⚓ {ownerName}", new Color(1.0f, 0.94f, 0.72f), 12f, root.layer, 34f);
+
+        return new WorldMapShipEntry
+        {
+            Root = root,
+            Label = label,
+            Ring = ring,
+            Animators = root.GetComponentsInChildren<Animator>(true)
+        };
+    }
+
+    private static void SetLayerRecursively(GameObject obj, int layer)
+    {
+        if (obj == null) return;
+        obj.layer = layer;
+        var t = obj.transform;
+        for (var i = 0; i < t.childCount; i++)
+            SetLayerRecursively(t.GetChild(i).gameObject, layer);
+    }
+
+    private static void AttachGenuineBoatMesh(Transform parent, float scale, int? overrideLayer = null)
+    {
+        var spawned = false;
+        var boats = GameSettings.Instance?.BoatSettings?.Boats;
+        if (boats != null)
+        {
+            foreach (var boat in boats)
+            {
+                if (boat != null && boat.gameObject != null)
+                {
+                    var clone = UnityEngine.Object.Instantiate(boat.gameObject, parent, false);
+                    clone.transform.localPosition = Vector3.zero;
+                    clone.transform.localRotation = Quaternion.identity;
+                    clone.transform.localScale = Vector3.one * scale;
+                    StripInteractiveComponents(clone);
+                    if (overrideLayer.HasValue) SetLayerRecursively(clone, overrideLayer.Value);
+                    clone.SetActive(true);
+                    spawned = true;
+                    break;
+                }
+            }
+        }
+
+        if (spawned) return;
+
         var hull = GameObject.CreatePrimitive(PrimitiveType.Cube);
         hull.transform.SetParent(parent, false);
         hull.transform.localPosition = new Vector3(0f, 0.25f, 0f);
         hull.transform.localScale = new Vector3(1.6f * scale, 0.55f * scale, 3.4f * scale);
         if (hull.TryGetComponent<Collider>(out var c1)) UnityEngine.Object.Destroy(c1);
         hull.GetComponent<Renderer>().sharedMaterial = GetLitMaterial(new Color(0.45f, 0.28f, 0.15f));
+        if (overrideLayer.HasValue) hull.layer = overrideLayer.Value;
 
         var mast = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         mast.transform.SetParent(parent, false);
@@ -477,54 +759,29 @@ internal static class FleetPhysicalActors
         mast.transform.localScale = new Vector3(0.12f * scale, 1.1f * scale, 0.12f * scale);
         if (mast.TryGetComponent<Collider>(out var c2)) UnityEngine.Object.Destroy(c2);
         mast.GetComponent<Renderer>().sharedMaterial = GetLitMaterial(new Color(0.32f, 0.20f, 0.11f));
+        if (overrideLayer.HasValue) mast.layer = overrideLayer.Value;
     }
 
-    private static void AttachDrifterCrewVisual(Transform parent)
-    {
-        try
-        {
-            var sampleAgent = Community.PlayerCommunity?.Agents?.FirstOrDefault(a => a != null);
-            var smr = sampleAgent != null ? sampleAgent.GetComponentInChildren<SkinnedMeshRenderer>() : null;
-            var crewRoot = smr != null && smr.transform.parent != null && smr.transform.parent != sampleAgent!.transform
-                ? smr.transform.parent.gameObject
-                : smr?.gameObject;
-            if (crewRoot != null)
-            {
-                var crewClone = UnityEngine.Object.Instantiate(crewRoot, parent, false);
-                crewClone.transform.localPosition = new Vector3(0f, 0.45f, -0.45f);
-                crewClone.transform.localRotation = Quaternion.identity;
-                StripInteractiveComponents(crewClone);
-                crewClone.SetActive(true);
-                return;
-            }
-        }
-        catch { }
-    }
-
-    private static GameObject AttachCargoCrates(Transform parent, bool activeInitially)
+    internal static GameObject AttachCargoCrates(Transform parent, bool activeInitially)
     {
         var group = new GameObject("CargoCrates");
         group.transform.SetParent(parent, false);
         group.transform.localPosition = new Vector3(0f, 0.42f, 0.45f);
 
         var spawnedNative = false;
-        try
+        var items = GameSettings.Instance?.ItemSettings?.ItemProperties;
+        var sample = items?.FirstOrDefault(p => p != null && p.StorageVisualPrefab != null);
+        if (sample?.StorageVisualPrefab != null)
         {
-            var items = GameSettings.Instance?.ItemSettings?.ItemProperties;
-            var sample = items?.FirstOrDefault(p => p != null && p.StorageVisualPrefab != null);
-            if (sample?.StorageVisualPrefab != null)
+            for (var i = 0; i < 2; i++)
             {
-                for (var i = 0; i < 2; i++)
-                {
-                    var crate = UnityEngine.Object.Instantiate(sample.StorageVisualPrefab.gameObject, group.transform, false);
-                    crate.transform.localPosition = new Vector3((i - 0.5f) * 0.45f, 0f, i * 0.25f);
-                    StripInteractiveComponents(crate);
-                    crate.SetActive(true);
-                }
-                spawnedNative = true;
+                var crate = UnityEngine.Object.Instantiate(sample.StorageVisualPrefab.gameObject, group.transform, false);
+                crate.transform.localPosition = new Vector3((i - 0.5f) * 0.45f, 0f, i * 0.25f);
+                StripInteractiveComponents(crate);
+                crate.SetActive(true);
             }
+            spawnedNative = true;
         }
-        catch { }
 
         if (!spawnedNative)
         {
@@ -543,19 +800,33 @@ internal static class FleetPhysicalActors
         return group;
     }
 
-    private static void AttachWorldBanner(Transform parent, string text, Color accent)
+    private static TextMeshPro AttachWorldBanner(
+        Transform parent,
+        string text,
+        Color accent,
+        float height = 3.1f,
+        int? overrideLayer = null,
+        float fontSize = 5.5f)
     {
-        var go = new GameObject("WorldBanner");
+        var go = new GameObject("WorldBannerTMP");
         go.transform.SetParent(parent, false);
-        go.transform.localPosition = new Vector3(0f, 3.1f, 0f);
-        var tm = go.AddComponent<TextMesh>();
-        tm.text = text;
-        tm.fontSize = 36;
-        tm.characterSize = 0.11f;
-        tm.anchor = TextAnchor.MiddleCenter;
-        tm.alignment = TextAlignment.Center;
-        tm.color = accent;
-        go.AddComponent<BillboardToCamera>();
+        go.transform.localPosition = new Vector3(0f, height, 0f);
+        if (overrideLayer.HasValue) go.layer = overrideLayer.Value;
+
+        var tmp = go.AddComponent<TextMeshPro>();
+        var nativeFont = ResolveNativeTmpFont();
+        if (nativeFont != null) tmp.font = nativeFont;
+        tmp.text = text;
+        tmp.fontSize = fontSize;
+        tmp.alignment = TextAlignmentOptions.Center;
+        tmp.color = accent;
+        tmp.textWrappingMode = TextWrappingModes.NoWrap;
+        tmp.outlineWidth = 0.22f;
+        tmp.outlineColor = new Color32(22, 18, 14, 235);
+
+        var billboard = go.AddComponent<BillboardToCamera>();
+        billboard.UseWorldMapCamera = overrideLayer.HasValue;
+        return tmp;
     }
 
     private static void StripInteractiveComponents(GameObject root)
@@ -599,61 +870,60 @@ internal static class FleetPhysicalActors
         ps.Play();
         UnityEngine.Object.Destroy(burst, 1.5f);
     }
+    internal static void SpawnMuzzleFlash(Vector3 position,Vector3 direction)
+    {
+        var flash=new GameObject("CannonMuzzleSmoke");flash.transform.SetPositionAndRotation(position,Quaternion.LookRotation(direction));
+        var ps=flash.AddComponent<ParticleSystem>();var main=ps.main;main.loop=false;main.duration=.2f;main.startLifetime=.35f;main.startSpeed=6;main.startSize=.45f;main.maxParticles=16;main.simulationSpace=ParticleSystemSimulationSpace.World;
+        main.startColor=new ParticleSystem.MinMaxGradient(new Color(1,.7f,.2f),new Color(.3f,.3f,.3f,.6f));
+        var emission=ps.emission;emission.rateOverTime=0;emission.SetBursts(new[]{new ParticleSystem.Burst(0,12)});var shape=ps.shape;shape.shapeType=ParticleSystemShapeType.Cone;shape.angle=18;
+        ps.GetComponent<ParticleSystemRenderer>().sharedMaterial=GetEmissiveMaterial(new Color(1,.7f,.3f,.8f));ps.Play();UnityEngine.Object.Destroy(flash,1.2f);
+    }
 
     internal static void SpawnNativeSplash(Vector3 pos)
     {
-        try
+        var splash = GameSettings.Instance?.FXSettings?.Splash;
+        if (splash != null)
         {
-            var splash = GameSettings.Instance?.FXSettings?.Splash;
-            if (splash != null)
-                ParticleController.Spawn(splash, new Vector3(pos.x, 0f, pos.z), Quaternion.identity);
+            try { ParticleController.Spawn(splash, new Vector3(pos.x, 0f, pos.z), Quaternion.identity); }
+            catch (Exception e) { Plugin.Log("Splash spawn skipped: " + e.GetType().Name); }
         }
-        catch { }
     }
 
     internal static void SpawnNativePopup(Vector3 pos, string text)
     {
         try { TextPopup.Spawn(pos, text); }
-        catch { }
+        catch (Exception e) { Plugin.Log("TextPopup skipped: " + e.GetType().Name); }
     }
 
     internal static void TriggerCameraShake(Vector3 worldPos, float intensity, float duration)
     {
-        try
-        {
-            var cam = Camera.main;
-            if (cam == null) return;
-            var horizDist = Vector2.Distance(new Vector2(cam.transform.position.x, cam.transform.position.z), new Vector2(worldPos.x, worldPos.z));
-            var falloff = Mathf.Clamp01(1f - horizDist / 120f);
-            if (falloff <= 0.05f) return;
-            _shakeIntensity = Mathf.Max(_shakeIntensity, intensity * falloff);
-            _shakeRemaining = Mathf.Max(_shakeRemaining, duration);
-        }
-        catch { }
+        var cam = Camera.main;
+        if (cam == null) return;
+        var horizDist = Vector2.Distance(new Vector2(cam.transform.position.x, cam.transform.position.z), new Vector2(worldPos.x, worldPos.z));
+        var falloff = Mathf.Clamp01(1f - horizDist / 120f);
+        if (falloff <= 0.05f) return;
+        _shakeIntensity = Mathf.Max(_shakeIntensity, intensity * falloff);
+        _shakeRemaining = Mathf.Max(_shakeRemaining, duration);
     }
 
     private static void UpdateCameraShake(float dt)
     {
         if (_shakeRemaining <= 0f) return;
         _shakeRemaining -= dt;
-        try
+        var camCtrl = CameraController.Instance;
+        if (camCtrl != null)
         {
-            var camCtrl = CameraController.Instance;
-            if (camCtrl != null)
-            {
-                var damper = Mathf.Clamp01(_shakeRemaining / 0.3f);
-                var jitter = new Vector3(
-                    UnityEngine.Random.Range(-1f, 1f) * _shakeIntensity * damper,
-                    0f,
-                    UnityEngine.Random.Range(-1f, 1f) * _shakeIntensity * damper);
-                camCtrl.transform.position += jitter * (dt * 12f);
-            }
+            var damper = Mathf.Clamp01(_shakeRemaining / 0.3f);
+            var jitter = new Vector3(
+                UnityEngine.Random.Range(-1f, 1f) * _shakeIntensity * damper,
+                0f,
+                UnityEngine.Random.Range(-1f, 1f) * _shakeIntensity * damper);
+            camCtrl.transform.position += jitter * (dt * 12f);
         }
-        catch { }
         if (_shakeRemaining <= 0f) _shakeIntensity = 0f;
     }
 
-    private static void SpawnWaterShockwaveRing(Vector3 pos, Color color, float maxRadius)
+    internal static void SpawnWaterShockwaveRing(Vector3 pos, Color color, float maxRadius)
     {
         var ringGo = new GameObject("Flotsam_WaterShockwave");
         ringGo.transform.position = new Vector3(pos.x, 0.18f, pos.z);
@@ -671,48 +941,47 @@ internal static class FleetPhysicalActors
         expander.BaseColor = color;
     }
 
+    internal static void PlayUiClick()
+    {
+        var cam = Camera.main;
+        if (cam == null) return;
+        PlayFleetSound("ui_click", cam.transform.position + cam.transform.forward * 1.2f, 0.35f);
+    }
+
     internal static void PlayFleetSound(string kind, Vector3 worldPos, float volume = 0.8f)
     {
-        try
+        if (!CachedSfx.TryGetValue(kind, out var clip) || clip == null)
         {
-            if (!CachedSfx.TryGetValue(kind, out var clip) || clip == null)
-            {
-                clip = FindOrSynthesizeAudioClip(kind);
-                CachedSfx[kind] = clip;
-            }
-            if (clip != null)
-                AudioSource.PlayClipAtPoint(clip, worldPos, Mathf.Clamp01(volume));
+            clip = FindOrSynthesizeAudioClip(kind);
+            CachedSfx[kind] = clip;
         }
-        catch { }
+        if (clip != null)
+            AudioSource.PlayClipAtPoint(clip, worldPos, Mathf.Clamp01(volume));
     }
 
     private static AudioClip FindOrSynthesizeAudioClip(string kind)
     {
-        try
+        var loaded = Resources.FindObjectsOfTypeAll<AudioClip>();
+        if (loaded != null && loaded.Length > 0)
         {
-            var loaded = Resources.FindObjectsOfTypeAll<AudioClip>();
-            if (loaded != null && loaded.Length > 0)
+            string[] keywords = kind switch
             {
-                string[] keywords = kind switch
-                {
-                    "cannon_fire" => new[] { "cannon", "shoot", "launch", "explosion", "thud" },
-                    "shell_impact" => new[] { "explosion", "impact", "crash", "destroy", "splash" },
-                    "cargo_deliver" => new[] { "complete", "pickup", "store", "bell", "pop" },
-                    "raid_board" => new[] { "alert", "warning", "sword", "hit", "salvage" },
-                    _ => new[] { "boat", "horn", "splash", "water" }
-                };
-                foreach (var kw in keywords)
-                {
-                    var match = loaded.FirstOrDefault(c => c != null && c.name != null && c.length > 0.08f && c.length < 4.5f && c.name.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0);
-                    if (match != null) return match;
-                }
+                "cannon_fire" => new[] { "cannon", "shoot", "launch", "explosion", "thud" },
+                "shell_impact" => new[] { "explosion", "impact", "crash", "destroy", "splash" },
+                "cargo_deliver" => new[] { "complete", "pickup", "store", "bell", "pop" },
+                "raid_board" => new[] { "alert", "warning", "sword", "hit", "salvage" },
+                "ui_click" => new[] { "click", "button", "tap", "select", "pop" },
+                _ => new[] { "boat", "horn", "splash", "water" }
+            };
+            foreach (var kw in keywords)
+            {
+                var match = loaded.FirstOrDefault(c => c != null && c.name != null && c.length > 0.03f && c.length < 4.5f && c.name.IndexOf(kw, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (match != null) return match;
             }
         }
-        catch { }
 
-        // Procedural fallback waveform so audio feedback is guaranteed even if native FMOD banks are streamed
         const int sampleRate = 22050;
-        var duration = kind == "shell_impact" ? 0.55f : kind == "cannon_fire" ? 0.42f : 0.35f;
+        var duration = kind == "ui_click" ? 0.06f : kind == "shell_impact" ? 0.55f : kind == "cannon_fire" ? 0.42f : 0.35f;
         var count = Mathf.CeilToInt(sampleRate * duration);
         var samples = new float[count];
         var rng = new System.Random(kind.GetHashCode());
@@ -720,9 +989,13 @@ internal static class FleetPhysicalActors
         for (var i = 0; i < count; i++)
         {
             var t = (float)i / sampleRate;
-            var env = Mathf.Exp(-t * (kind == "shell_impact" ? 5.5f : 8.0f));
+            var env = Mathf.Exp(-t * (kind == "ui_click" ? 45f : kind == "shell_impact" ? 5.5f : 8.0f));
             var noise = (float)(rng.NextDouble() * 2.0 - 1.0);
-            if (kind == "cannon_fire" || kind == "shell_impact")
+            if (kind == "ui_click")
+            {
+                samples[i] = Mathf.Sin(2f * Mathf.PI * 880f * t) * env * 0.4f;
+            }
+            else if (kind == "cannon_fire" || kind == "shell_impact")
             {
                 var freq = kind == "cannon_fire" ? Mathf.Lerp(140f, 38f, t / duration) : Mathf.Lerp(110f, 28f, t / duration);
                 var boom = Mathf.Sin(2f * Mathf.PI * freq * t);
@@ -755,7 +1028,7 @@ internal static class FleetPhysicalActors
 
         private void Update()
         {
-            _elapsed += Time.deltaTime;
+            _elapsed += Mathf.Min(Time.unscaledDeltaTime, 0.1f);
             var t = Mathf.Clamp01(_elapsed / Lifetime);
             if (Line != null)
             {
@@ -776,33 +1049,41 @@ internal static class FleetPhysicalActors
 
     private static Material GetLitMaterial(Color color)
     {
+        if(LitMaterials.TryGetValue(color,out var cached))return cached;
         if (_litMat == null)
         {
-            var sh = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard") ?? Shader.Find("Sprites/Default");
+            var sh = Shader.Find("Standard") ?? Shader.Find("Legacy Shaders/Diffuse") ?? Shader.Find("Sprites/Default");
             _litMat = new Material(sh);
         }
-        var mat = new Material(_litMat) { color = color };
-        return mat;
+        var result=new Material(_litMat){color=color};LitMaterials.Add(color,result);return result;
     }
 
-    private static Material GetEmissiveMaterial(Color color)
+    internal static Material GetEmissiveMaterial(Color color)
     {
+        if(EmissiveMaterials.TryGetValue(color,out var cached))return cached;
         if (_emissiveMat == null)
         {
             var sh = Shader.Find("Sprites/Default") ?? Shader.Find("Unlit/Color") ?? Shader.Find("Standard");
             _emissiveMat = new Material(sh);
         }
-        var mat = new Material(_emissiveMat) { color = color };
-        return mat;
+        var result=new Material(_emissiveMat){color=color};EmissiveMaterials.Add(color,result);return result;
     }
 
     private sealed class BillboardToCamera : MonoBehaviour
     {
+        public bool UseWorldMapCamera;
+
         private void LateUpdate()
         {
-            var cam = Camera.main;
-            if (cam != null)
-                transform.rotation = Quaternion.LookRotation(transform.position - cam.transform.position);
+            Camera? cam = null;
+            if (UseWorldMapCamera)
+            {
+                var map = GameManager.WorldMapManager?.WorldMap;
+                if (map != null) cam = map.GetComponentInChildren<Camera>();
+            }
+            cam ??= Camera.main;
+            if (cam == null) return;
+            transform.rotation = Quaternion.LookRotation(transform.position - cam.transform.position, Vector3.up);
         }
     }
 }

@@ -26,10 +26,12 @@ public sealed class Plugin : BaseUnityPlugin
 
     private void Awake()
     {
+        _harmony = new Harmony("local.flotsam.multiplayer");
+        PatchEpicUserStoragePath(_harmony);
         var path = Environment.GetEnvironmentVariable("FLOTSAM_MULTIPLAYER_CONFIG");
         if (string.IsNullOrWhiteSpace(path))
         {
-            Logger.LogInfo("No multiplayer config; standalone game unchanged.");
+            Logger.LogInfo("No multiplayer config; standalone Epic settings path fix active.");
             enabled = false;
             return;
         }
@@ -46,19 +48,23 @@ public sealed class Plugin : BaseUnityPlugin
             ReportRoot = Path.GetDirectoryName(Path.GetFullPath(path))!;
             Instance = this;
             ApplyDisplaySettings();
-            _harmony = new Harmony("local.flotsam.multiplayer");
             var defaultDataPath = Path.GetFullPath(Application.persistentDataPath);
             if (!string.Equals(
                     Options.profile.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
                     defaultDataPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
                     StringComparison.OrdinalIgnoreCase))
             {
+                SyncProfileSettings(defaultDataPath, Options.profile);
                 _harmony.Patch(AccessTools.PropertyGetter(typeof(Application), "persistentDataPath"),
                     prefix: new HarmonyMethod(typeof(Plugin), nameof(ProfilePath)));
             }
 
             if (Options.mode == "independent") FleetRuntime.Install(_harmony);
             GamePatches.Install(_harmony);
+            FleetCombat.Install(_harmony);
+            FleetPersistence.Install(_harmony);
+            FleetSaving.Install(_harmony);
+            FleetVoyages.Install(_harmony);
             Network = new GameSession(Options);
             _hud = FleetHud.Attach(gameObject);
             Status = "等待游戏会话";
@@ -68,6 +74,50 @@ public sealed class Plugin : BaseUnityPlugin
         {
             Logger.LogError(e);
             enabled = false;
+        }
+    }
+
+    private static void PatchEpicUserStoragePath(Harmony harmony)
+    {
+        var epicUser = AccessTools.TypeByName("M4.Session.EpicUser");
+        var loadFile = epicUser != null ? AccessTools.DeclaredMethod(epicUser, "LoadFile") : null;
+        if (loadFile != null)
+        {
+            harmony.Patch(loadFile, prefix: new HarmonyMethod(typeof(Plugin), nameof(ResolveUserStoragePath)));
+        }
+    }
+
+    private static void ResolveUserStoragePath(ref string __0)
+    {
+        if (!string.IsNullOrWhiteSpace(__0) && !Path.IsPathRooted(__0))
+        {
+            __0 = Path.Combine(Application.persistentDataPath, __0);
+        }
+    }
+
+    private static void SyncProfileSettings(string defaultDataPath, string profilePath)
+    {
+        try
+        {
+            var src = Path.Combine(defaultDataPath, "PlayerSettings.json");
+            if (!File.Exists(src)) return;
+            var dst = Path.Combine(profilePath, "PlayerSettings.json");
+            var shouldCopy = !File.Exists(dst);
+            if (!shouldCopy)
+            {
+                var srcText = File.ReadAllText(src);
+                var dstText = File.ReadAllText(dst);
+                var srcZero = srcText.Contains("\"SelectedLanguageIndex\":0");
+                var dstZero = dstText.Contains("\"SelectedLanguageIndex\":0");
+                if (!srcZero && dstZero) shouldCopy = true;
+                else if (!(srcZero && !dstZero) && File.GetLastWriteTimeUtc(src) > File.GetLastWriteTimeUtc(dst))
+                    shouldCopy = true;
+            }
+            if (shouldCopy) File.Copy(src, dst, overwrite: true);
+        }
+        catch (Exception e)
+        {
+            Log("SyncProfileSettings skipped: " + e.Message);
         }
     }
 
@@ -89,7 +139,10 @@ public sealed class Plugin : BaseUnityPlugin
                     Screen.SetResolution(nativeW, nativeH, FullScreenMode.FullScreenWindow);
             }
         }
-        catch { }
+        catch (Exception e)
+        {
+            Log("ApplyDisplaySettings skipped: " + e.Message);
+        }
     }
 
     private static bool ProfilePath(ref string __result)
@@ -111,19 +164,39 @@ public sealed class Plugin : BaseUnityPlugin
                 Session.Profile.StartRun(setup);
             }
             Network?.Update();
-            FleetOwnedNavigation.Tick(Time.deltaTime);
-            FleetPhysicalActors.Tick(Time.deltaTime);
-            if (Network != null && File.Exists(Path.Combine(ReportRoot, "stop"))) Network.Dispose();
-            if (Time.realtimeSinceStartup >= _nextReport)
+            FleetSaving.Tick();
+            FleetPersistence.Tick();
+            FleetOwnedNavigation.Tick(GameSpeedManager.PausableUnscaledDeltaTime);
+            var dt = Mathf.Min(GameSpeedManager.PausableUnscaledDeltaTime, 0.1f);
+            if (Network?.IsHost == true && GameSession.Ready())
             {
-                _nextReport = Time.realtimeSinceStartup + 2f;
-                WriteRuntimeStatus();
+                FleetInteractions.TickHost(dt);
+                BuildingDurability.Tick(dt);
             }
+            FleetPhysicalActors.Tick(dt);
+            FleetCombat.Tick(dt);
+            FleetVoyages.Tick(dt);
         }
         catch (Exception e)
         {
             Logger.LogError(e);
             Status = e.Message;
+        }
+        finally
+        {
+            try
+            {
+                if (Network != null && File.Exists(Path.Combine(ReportRoot, "stop"))) Network.Dispose();
+                if (Time.realtimeSinceStartup >= _nextReport)
+                {
+                    _nextReport = Time.realtimeSinceStartup + 2f;
+                    WriteRuntimeStatus();
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogError(e);
+            }
         }
     }
 
@@ -133,7 +206,7 @@ public sealed class Plugin : BaseUnityPlugin
         if (ready) Status = "游戏世界就绪";
         if (Network != null) Status = Network.Status;
         var regular = Community.Communities.Where(c => c != null && (c.IsPlayerCommunity() || FleetEngineBundle.IsSecondary(c))).ToArray();
-        var ships = regular.Select(c => new ShipProbe
+        var ships = regular.Select(c => new ShipStatus
         {
             name = c.Name ?? "",
             primary = c.IsPlayerCommunity(),
@@ -141,7 +214,7 @@ public sealed class Plugin : BaseUnityPlugin
             agents = c.Agents.Count(a => a != null),
             energy = FleetEngineBundle.EnergyOf(c)
         }).ToArray();
-        var report = new RuntimeProbe
+        var report = new RuntimeStatus
         {
             role = Options.role,
             mode = Options.mode,
@@ -154,27 +227,41 @@ public sealed class Plugin : BaseUnityPlugin
             agents = regular.Sum(c => c.Agents.Count(a => a != null)),
             local = Community.PlayerCommunity?.Name ?? "",
             fleet = ships,
+            phase = Network?.Phase??"starting",
+            latency = Network?.Latency??0,
+            queueDepth = Network?.QueueDepth??0,
+            captureMilliseconds = Network?.CaptureMilliseconds??0,
             status = Status
         };
-        File.WriteAllText(Path.Combine(ReportRoot, "probe.json"), JsonCodec.Text(report));
+        var destination=Path.Combine(ReportRoot,"runtime.json");var temporary=destination+".tmp";
+        File.WriteAllText(temporary,JsonCodec.Text(report));
+        if(File.Exists(destination))File.Replace(temporary,destination,null);else File.Move(temporary,destination);
     }
 
     private void LateUpdate()
     {
-        try { LiveNavigation.Commit(); }
+        try
+        {
+            LiveNavigation.Commit();
+            ClientOceanAnchor.LateTickCameraAndHighlighters();
+            FleetCombat.LateInput();
+        }
         catch (Exception e) { Logger.LogError(e); }
     }
 }
 
-public sealed class RuntimeProbe
+public sealed class RuntimeStatus
 {
     public string role = "", mode = "", local = "", status = "";
+    public string phase="starting";
+    public int latency,queueDepth;
+    public float captureMilliseconds;
     public bool ready, replicaReady, connected;
     public int peers, ships, buildings, agents;
-    public ShipProbe[] fleet = Array.Empty<ShipProbe>();
+    public ShipStatus[] fleet = Array.Empty<ShipStatus>();
 }
 
-public sealed class ShipProbe
+public sealed class ShipStatus
 {
     public string name = "";
     public bool primary;

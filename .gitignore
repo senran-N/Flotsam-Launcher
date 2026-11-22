@@ -23,6 +23,7 @@ multiplayer/lab/
 # Packaged executables & runtime diagnostics
 release/
 浮游启动器.exe
+启动双开联机测试.cmd
 diagnostics.json
 *.log
 

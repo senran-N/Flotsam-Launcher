@@ -12,9 +12,9 @@ namespace Flotsam.Multiplayer;
 // the existing GameCommand schema, never a recreated/FinishBuilding replacement object.
 internal static class MoveConstructionCommands
 {
-    internal const string Move="buildingMove", Store="buildingStore";
+    internal const string Move="buildingMove", Store="buildingStore", RoadStore="roadStore";
     private static readonly Dictionary<MoveBuildableCursorProperties,Selection> Selections=new Dictionary<MoveBuildableCursorProperties,Selection>();
-    private static readonly Dictionary<Buildable,string> Quarantined=new Dictionary<Buildable,string>();
+    private static readonly Dictionary<MoveBuildableCursorProperties,Buildable> RoadSelections=new Dictionary<MoveBuildableCursorProperties,Buildable>();
     private static Obstacle? _movingObstacle;
     private static bool _obstaclePatchInstalled;
     internal static void Install(Harmony harmony)
@@ -40,15 +40,13 @@ internal static class MoveConstructionCommands
     private static FieldInfo F(Type type,string name)=>AccessTools.Field(type,name);
     private static readonly MethodInfo UpdateTransform=AccessTools.DeclaredMethod(typeof(ConstructionCursorProperties),"UpdateTransform",new[]{typeof(ConstructionPreview),typeof(Vector3),typeof(Vector2).MakeByRefType(),typeof(bool),typeof(Hookable)});
     private static bool Client=>Plugin.Instance?.Network is GameSession n&&n.IsClient&&n.ReplicaReady&&!n.Applying;
-    // Set true ONLY after stored membership + gameObject active state are carried in the
-    // authoritative frame and ApplyStoredState is connected. Default cannot silently desync.
-    internal static bool StorageReplicationReady {get;set;}
-    internal static bool Handles(string kind)=>kind==Move||kind==Store;
+    internal static bool Handles(string kind)=>kind==Move||kind==Store||kind==RoadStore;
     internal static bool IsStored(Buildable building)=>building!=null&&building.Community!=null&&building.Community.StoredBuildables.Values.Any(list=>list.Contains(building));
-    internal static string? QuarantineReason(Buildable building)=>Quarantined.TryGetValue(building,out var reason)?reason:null;
-    // Integration: reject ALL target-based operations on this object, not only move/store.
-    internal static bool IsQuarantined(Buildable building)=>Quarantined.ContainsKey(building);
-    internal static void ResetClientPreviews(){foreach(var cursor in Selections.Keys.ToArray())Clear(cursor);}
+    internal static void ResetClientPreviews()
+    {
+        foreach(var cursor in Selections.Keys.ToArray())Clear(cursor);
+        RoadSelections.Clear();
+    }
 
     private sealed class Selection
     {
@@ -59,25 +57,40 @@ internal static class MoveConstructionCommands
         internal Selection(Buildable building,ConstructionPreview preview,SingleConstructionPreviewStrategy strategy,bool fromStorage=false){Building=building;Preview=preview;Strategy=strategy;FromStorage=fromStorage;}
     }
 
+    private static bool IsRoadBuildable(Buildable? b)=>b!=null&&(b.GetComponent<WalkwaySegment>()!=null||b.GetComponent<WalkwayPonton>()!=null);
+
+    private static string? RoadEligible(Buildable b,Community? owner=null)
+    {
+        var community=owner??b?.Community??Community.PlayerCommunity;
+        if(b==null||b.Community!=community)return "道路已不存在或不属于本城镇";
+        if(b.BuildPhase!=BuildPhase.Finished||b.AssignedProject!=null)return "道路尚未完工";
+        if(b.ReturnAgentsOnBuildable().Length>0||b.GetComponentsInChildren<Agent>(true).Length>0)return "请等待栈道上的居民走开后再调整道路";
+        if(b.TryGetComponent<Construction>(out var construction))
+        {
+            using var _scope=FleetRuntime.WithPlayerCommunity(community);
+            if(construction.NeighbourConstructions.Any(n=>n!=null&&!n.IsConnectedToTownheart(construction)))
+                return "移除此段栈道会切断其他建筑与城镇核心的连接";
+        }
+        return null;
+    }
+
     private static string? Eligible(Buildable b,bool stored=false,Community? owner=null)
     {
         var community=owner??b?.Community??Community.PlayerCommunity;
         if(b==null||b.Community!=community)return "建筑已不存在或不属于本城镇";
-        if(Quarantined.TryGetValue(b,out var reason))return "建筑已隔离，须由房主重新载入权威存档："+reason;
-        if(b.Properties.PlacementCursorProperties==null||b.Properties.PlacementCursorProperties.GetType()!=typeof(SingleConstructionCursorProperties)||b.Properties.UseCustomSize||b.Properties.RequiresMooringPoint)return "此建筑不是已适配的普通单体建筑";
+        if(b.Properties.PlacementCursorProperties==null||b.Properties.PlacementCursorProperties.GetType()!=typeof(SingleConstructionCursorProperties)||b.Properties.RequiresMooringPoint)return "此建筑不是普通单体建筑";
         if(b.BuildPhase!=BuildPhase.Finished||b.AssignedProject!=null)return "建筑尚未完工或仍有建造项目";
         var root=FleetEngineBundle.RootFor(community)??Construction.Townheart;
         if(!b.TryGetComponent<Construction>(out var construction)||construction==root||construction.Target==null||construction.Target.PrimaryMarker==null)return "不能移动城镇核心或缺少原生施工图节点的建筑";
-        if(b.GetComponent<Boat>()!=null||b.GetComponent<WalkwaySegment>()!=null||b.GetComponent<WalkwayPonton>()!=null||b.GetComponent<EnergyGridBuildableComponent>()!=null||b.GetComponent<EnergyGridPole>()!=null||b.GetComponent<DecorationSlots>()!=null)return "道路、船只、能源和附属装饰建筑暂不支持移动/收纳";
+        if(b.GetComponent<Boat>()!=null||b.GetComponent<WalkwaySegment>()!=null||b.GetComponent<WalkwayPonton>()!=null||b.GetComponent<EnergyGridPole>()!=null)return "小艇与独立电线杆请直接拆除重建";
+        if(b.GetComponentsInChildren<Decoration>(true).Length>0)return "请先移除建筑上的装饰挂件再移动";
         if(b.GetComponentInChildren<Buoyancy>(true)==null)return "建筑缺少原生浮力组件";
         if(b.ReturnAgentsOnBuildable().Length>0||b.GetComponentsInChildren<Agent>(true).Length>0||b.GetWorkers().Count>0)return "请先等待建筑上的居民和工作人员离开";
         var obstacle=b.GetComponent<Obstacle>();
         if(obstacle==null||((System.Collections.ICollection)F(typeof(Obstacle),"_pathfindingPolygons").GetValue(obstacle)).Count==0)return "建筑原生障碍图尚未初始化";
-        if(b.TryGetComponent<Producer>(out var producer)&&producer.QueuedRecipes.Count>0)return "请先完成或取消建筑生产队列";
-        foreach(var section in b.Inventory.SubInventoryTypes)
-            if(b.Inventory.ReturnAllItems(section,new List<Item>()).Any(item=>item.IsReserved))return "建筑库存仍有预留物品";
-        if(construction.NeighbourConstructions.Any(n=>n==null||n.Buildable==null||n.Buildable.GetComponent<WalkwaySegment>()!=null||n.Buildable.GetComponent<WalkwayPonton>()!=null))return "建筑仍连接道路或失效邻居，暂不可移动";
+        if(construction.NeighbourConstructions.Any(n=>n==null||n.Buildable==null))return "建筑邻居状态正在同步，请稍候重试";
         if(!stored&&(!b.gameObject.activeSelf||!b.IsDraggable()||!community.Constructions.Contains(construction)||IsStored(b)))return "建筑当前不能被原生移动";
+        using var _scope=FleetRuntime.WithPlayerCommunity(community);
         if(!stored&&construction.NeighbourConstructions.Any(n=>!n.IsConnectedToTownheart(construction)))return "移动会切断其他建筑与城镇核心的连接";
         return null;
     }
@@ -85,7 +98,6 @@ internal static class MoveConstructionCommands
     private static string? StoredEligible(Buildable building,Community? owner=null)
     {
         var community=owner??building.Community??Community.PlayerCommunity;
-        if(!StorageReplicationReady)return "建筑收纳同步尚未接入";
         var error=Eligible(building,true,community);if(error!=null)return error;
         var construction=building.GetComponent<Construction>();
         if(!IsStored(building)||building.gameObject.activeSelf||building.IsActive||community.Constructions.Contains(construction)||construction.NeighbourConstructions.Count!=0||construction.Target.PrimaryMarker.Node!=null)return "库存建筑状态不完整，须等待权威同步";
@@ -100,7 +112,13 @@ internal static class MoveConstructionCommands
     {
         if(!Client)return true;
         Clear(__instance);
-        if(!Community.PlayerCommunity.StoredBuildables.TryGetValue(properties,out var list)||list.Count==0){Reject("库存中没有此建筑");return false;}
+        RoadSelections.Remove(__instance);
+        if(properties?.PlacementCursorProperties is LineConstructionCursorProperties lineCursor)
+        {
+            GameManager.CursorManager.Activate(lineCursor);
+            return false;
+        }
+        if(!Community.PlayerCommunity.StoredBuildables.TryGetValue(properties!,out var list)||list.Count==0){Reject("库存中没有此建筑");return false;}
         var building=list[list.Count-1];var error=StoredEligible(building);
         if(error!=null){Reject(error);return false;}
         CreateSelection(__instance,building,true);return false;
@@ -111,8 +129,20 @@ internal static class MoveConstructionCommands
     // deactivate/disconnect the authoritative replica before the final placement click.
     internal static bool ClientPickUp(MoveBuildableCursorProperties __instance,Buildable selected)
     {
+        if(selected==null)return false;
+        if(Plugin.Instance?.Network is GameSession net&&!net.Applying&&selected.Community!=Community.PlayerCommunity){Reject("只能移动本船建筑");return false;}
         if(!Client)return true;
         Clear(__instance);
+        RoadSelections.Remove(__instance);
+        if(IsRoadBuildable(selected))
+        {
+            var roadErr=RoadEligible(selected);
+            if(roadErr!=null){Reject(roadErr);return false;}
+            RoadSelections[__instance]=selected;
+            F(typeof(BuildableCursorProperties),"_buildable").SetValue(__instance,null);
+            Plugin.Instance?.Network?.ShowNotice("已选中栈道：点击收纳可回收材料，或点击海面重新铺设",false);
+            return false;
+        }
         var error=Eligible(selected);
         if(error!=null){Reject(error);return false;}
         CreateSelection(__instance,selected,false);return false;
@@ -150,13 +180,27 @@ internal static class MoveConstructionCommands
     internal static bool ClientPlace(MoveBuildableCursorProperties __instance)
     {
         if(!Client)return true;
+        if(RoadSelections.TryGetValue(__instance,out var roadBuilding))
+        {
+            RoadSelections.Remove(__instance);
+            if(roadBuilding!=null)
+            {
+                var network=Plugin.Instance!.Network!;
+                var roadId=network.Id(roadBuilding);
+                var pontonProps=roadBuilding.Properties is WalkwaySegmentProperties wsp?wsp.walkwayPontonProperties:roadBuilding.Properties;
+                if(roadId>0)network.Submit(new GameCommand{kind=RoadStore,target=roadId});
+                if(pontonProps?.PlacementCursorProperties is LineConstructionCursorProperties lineCursor)
+                    GameManager.CursorManager.Activate(lineCursor);
+            }
+            return false;
+        }
         if(!Selections.TryGetValue(__instance,out var selection))return false;
         if(!selection.Preview.CanPlace||selection.Preview.Hookable==null){Reject("建筑位置或原生碰撞校验未通过");return false;}
-        var network=Plugin.Instance!.Network!;
-        var target=network.Id(selection.Building);var reference=network.Id(selection.Preview.Hookable.Buildable);
+        var net=Plugin.Instance!.Network!;
+        var target=net.Id(selection.Building);var reference=net.Id(selection.Preview.Hookable.Buildable);
         if(target<=0||reference<=0){Reject("移动目标或挂钩尚未同步");return false;}
-        var input=CursorManager.BuildingPosition;
-        network.Submit(new GameCommand{kind=Move,target=target,reference=reference,x=input.x,z=input.z,value=Settings.Instance.GameplayPlayerData.SnapBuilding?1:0,amount=selection.FromStorage?1:0});
+        var input=ClientOceanAnchor.ClientToHostPos(CursorManager.BuildingPosition);
+        net.Submit(new GameCommand{kind=Move,target=target,reference=reference,x=input.x,z=input.z,value=Settings.Instance.GameplayPlayerData.SnapBuilding?1:0,amount=selection.FromStorage?1:0});
         Clear(__instance);return false;
     }
 
@@ -166,25 +210,36 @@ internal static class MoveConstructionCommands
     internal static bool ClientRemove(MoveBuildableCursorProperties __instance,bool store)
     {
         if(!Client)return true;
+        if(RoadSelections.TryGetValue(__instance,out var roadBuilding))
+        {
+            RoadSelections.Remove(__instance);
+            if(store&&roadBuilding!=null)
+            {
+                var network=Plugin.Instance!.Network!;var target=network.Id(roadBuilding);
+                if(target<=0)Reject("栈道尚未同步");
+                else network.Submit(new GameCommand{kind=RoadStore,target=target});
+            }
+            return false;
+        }
         if(store&&Selections.TryGetValue(__instance,out var selection)&&!selection.FromStorage)
         {
-            if(!StorageReplicationReady)Reject("建筑收纳同步尚未接入，未修改任何建筑");
-            else
-            {
-                var network=Plugin.Instance!.Network!;var target=network.Id(selection.Building);
-                if(target<=0)Reject("收纳建筑尚未同步");
-                else network.Submit(new GameCommand{kind=Store,target=target});
-            }
+            var network=Plugin.Instance!.Network!;var target=network.Id(selection.Building);
+            if(target<=0)Reject("收纳建筑尚未同步");
+            else network.Submit(new GameCommand{kind=Store,target=target});
         }
         Clear(__instance);return false;
     }
 
     // Prefix DeactivateImmediately; native function can continue, its _buildable and preview
     // fields are already null. Also call on world reset/disconnect if this cursor persists.
-    internal static void ClientCancel(MoveBuildableCursorProperties __instance){if(Selections.ContainsKey(__instance))Clear(__instance);}
+    internal static void ClientCancel(MoveBuildableCursorProperties __instance)
+    {
+        if(Selections.ContainsKey(__instance))Clear(__instance);
+        RoadSelections.Remove(__instance);
+    }
     // Keep the existing deny prefix on SetSelectedBuildableProperties: stored retrieval,
     // roads and decorations are explicitly outside this slice.
-    private static void Reject(string error){var network=Plugin.Instance?.Network;if(network!=null)network.LastResult=new CommandResult{accepted=false,error=error};}
+    private static void Reject(string error)=>Plugin.Instance?.Network?.ShowNotice(error,true);
     private static void Clear(MoveBuildableCursorProperties cursor)
     {
         if(!Selections.TryGetValue(cursor,out var selection))return;
@@ -221,16 +276,39 @@ internal static class MoveConstructionCommands
 
     internal static string? Execute(GameCommand command,IReadOnlyDictionary<long,Buildable> buildings,Community? owner=null)
     {
+        if(buildings.TryGetValue(command.target,out var mounted)&&mounted!=null&&FleetCombat.IsOccupied(mounted))return "请等待炮手退出并完成装填后移动平台";
         var community=owner??Community.PlayerCommunity;
+        using var _scope=FleetRuntime.WithPlayerCommunity(community);
         var heartPos=FleetEngineBundle.RootFor(community)?.transform.position??Construction.TownheartPosition;
         if(!Handles(command.kind))return "未知移动指令";
         if(!_obstaclePatchInstalled)return "原生移动障碍图重入补丁尚未安装";
         if(!GameSession.Ready())return "房主游戏尚未就绪";
         if(!buildings.TryGetValue(command.target,out var building)||building==null)return "目标建筑已不存在";
+        if(command.kind==RoadStore)
+        {
+            var roadErr=RoadEligible(building,community);
+            if(roadErr!=null)return roadErr;
+            foreach(var section in building.Inventory.SubInventoryTypes.ToArray())
+            {
+                foreach(var item in building.Inventory.ReturnAllItems(section,new List<Item>()).ToArray())
+                {
+                    if(item?.Properties!=null)
+                    {
+                        if(item.IsReserved)item.CancelReservation();
+                        building.Inventory.RemoveItem(item.Properties,section);
+                        community.SpawnItemToAvailableStorage(item.Properties);
+                    }
+                }
+            }
+            if(building.TryGetComponent<WalkwayPonton>(out var ponton))
+                ponton.RemoveAttachedWalkwaySegment();
+            building.Deactivate();
+            building.Remove();
+            return null;
+        }
         if(command.kind==Move&&(command.amount<0||command.amount>1))return "库存取出标志无效";
         var fromStorage=command.kind==Move&&command.amount==1;
         var error=fromStorage?StoredEligible(building,community):Eligible(building,false,community);if(error!=null)return error;
-        if(command.kind==Store&&!StorageReplicationReady)return "建筑收纳同步尚未接入";
         if(command.kind==Store&&building.Inventory.SubInventoryTypes.Any(section=>section!=SubInventoryType.Composition&&building.Inventory.ReturnAllItems(section,new List<Item>()).Count>0))return "请先清空建筑存货再收纳，结构材料会保留原对象";
         if(BuildingDevTools.InstantBuild||BuildingDevTools.AutoSpawnResources)return "联机移动不允许开发者资源模式";
         var source=building.Properties.PlacementCursorProperties;
@@ -253,6 +331,20 @@ internal static class MoveConstructionCommands
                 Preview(strategy,preview,building,input,command.value==1);
                 if(!preview.CanPlace||!preview.IsHooked||preview.Hookable!=expectedHook)return "移动位置、碰撞或连接校验失败";
             }
+            // Cleanly release any active production queue or item reservations before snapshotting
+            if(!fromStorage)
+            {
+                if(building.TryGetComponent<Producer>(out var prod))
+                {
+                    while(prod.QueuedRecipes.Count>0)
+                        prod.CancelRecipe(0);
+                }
+                foreach(var sec in building.Inventory.SubInventoryTypes.ToArray())
+                {
+                    foreach(var it in building.Inventory.ReturnAllItems(sec,new List<Item>()))
+                        if(it!=null&&it.IsReserved)it.CancelReservation();
+                }
+            }
             // Snapshot BEFORE any native mutation. A refused preview never touches graph, phase,
             // inventory or the stored dictionary. Native mutation is synchronous on the main thread.
             var journal=new Journal(building);
@@ -265,7 +357,7 @@ internal static class MoveConstructionCommands
             try
             {
                 _movingObstacle=obstacle;
-                var storedPosition=Vector3.back*(GameSettings.Instance.GameplaySettings.DestructionRadius-50);
+                var storedPosition=heartPos+Vector3.back*45f;
                 F(typeof(SingleConstructionPreviewStrategy),"_storedPosition").SetValue(strategy,storedPosition);
                 if(fromStorage)
                 {
@@ -304,10 +396,8 @@ internal static class MoveConstructionCommands
                 catch(Exception rollbackFailure)
                 {
                     var reason=failure.GetType().Name+" / rollback "+rollbackFailure.GetType().Name;
-                    Quarantined[building]=reason;
-                    try{if(GameSpeedManager.GameSpeed!=GameSpeed.Paused)GameSpeedManager.Pause();}catch(Exception pauseFailure){Plugin.Log("Unable to pause quarantined world: "+pauseFailure);}
-                    Plugin.Log("Move quarantine "+building.Properties.name+": "+failure+"; rollback: "+rollbackFailure);
-                    return "原生操作及回滚失败，建筑已隔离；房主须暂停并重载存档："+reason;
+                    Plugin.Log("Move rollback error on "+building.Properties.name+": "+failure+"; rollback: "+rollbackFailure);
+                    return "原生操作及回滚失败："+reason;
                 }
             }
             finally
@@ -338,7 +428,6 @@ internal static class MoveConstructionCommands
         private readonly int _hookIndex;
         private readonly Hookable.Edge[]? _hookEdges;
         private readonly int _communityBuildingCount;
-        internal string VerificationSummary=>"pose+rotation+phase+active+stored+neighbours+marker+graphNodes="+_graphNodeCount+"+polygons="+_polygons.Length+"+sameItems="+_items.Sum(pair=>pair.Value.Length);
         internal Journal(Buildable building)
         {
             _building=building;_position=building.transform.position;_rotation=building.transform.rotation;Active=building.IsActive;_objectActive=building.gameObject.activeSelf;

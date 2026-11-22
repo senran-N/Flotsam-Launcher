@@ -28,7 +28,6 @@ if (!(Test-Path -LiteralPath (Join-Path $payload 'BepInEx.zip'))) {
 
 if ($Deploy) {
     $targets = @(
-        (Join-Path $GameRoot 'BepInEx\plugins\Flotsam.Multiplayer'),
         (Join-Path $root 'multiplayer\lab\host\BepInEx\plugins\Flotsam.Multiplayer'),
         (Join-Path $root 'multiplayer\lab\client\BepInEx\plugins\Flotsam.Multiplayer')
     )

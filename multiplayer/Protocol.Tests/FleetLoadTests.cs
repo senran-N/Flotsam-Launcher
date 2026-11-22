@@ -20,6 +20,8 @@ public static class FleetLoadTests
     private const string Fingerprint="0f1e2d3c4b5a69788796a5b4c3d2e1f0";
     public static int Run()
     {
+        ThreadPool.GetMinThreads(out var minW,out var minIo);
+        ThreadPool.SetMinThreads(Math.Max(minW,64),Math.Max(minIo,64));
         var passed=0;
         void Case(string name,Action body){body();Console.WriteLine("PASS "+name);passed++;}
 
@@ -231,7 +233,7 @@ public static class FleetLoadTests
             var guests=JoinAll(host,7);
             for(var i=0;i<guests.Count;i++)
                 guests[i].Connection!.Send(new Packet{type="command",command=new GameCommand{sequence=i+1,kind="place"}});
-            WaitUntil(()=>host.Applied==7,TimeSpan.FromSeconds(8),"seven applied");
+            WaitUntil(()=>host.Applied==7&&host.AcceptedCommands==7,TimeSpan.FromSeconds(8),"seven applied");
             foreach(var guest in guests)guest.Dispose();
             WaitUntil(()=>host.PeerCount==0,TimeSpan.FromSeconds(8),"all peers released");
             var accepted=host.AcceptedCommands;var rejected=host.RejectedCommands;
@@ -285,6 +287,7 @@ public static class FleetLoadTests
         private readonly CancellationTokenSource _stop=new CancellationTokenSource();
         private readonly ConcurrentDictionary<string,Connection> _peers=new ConcurrentDictionary<string,Connection>(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<long,int> _distinct=new ConcurrentDictionary<long,int>();
+        private readonly object _mainThreadGate=new object();
         private readonly Task _accepting;
         private int _refused,_failures,_applied,_accepted,_rejected,_results,_acks,_removed;
         public HostHarness(string secret,string fingerprint)
@@ -331,7 +334,7 @@ public static class FleetLoadTests
                 var stream=socket.GetStream();var nonce=Frames.RandomToken();
                 await Frames.Write(stream,new Packet{type="challenge",nonce=nonce},deadline.Token).ConfigureAwait(false);
                 var hello=await Frames.Read(stream,deadline.Token).ConfigureAwait(false);
-                if(hello.type!="hello"||hello.protocol!=4||hello.peer.Length!=32||!Guid.TryParseExact(hello.peer,"N",out _)||!Frames.Verify(_secret,"client",nonce,hello.peer,hello.fingerprint,hello.proof))
+                if(hello.type!="hello"||hello.protocol!=Frames.ProtocolVersion||hello.peer.Length!=32||!Guid.TryParseExact(hello.peer,"N",out _)||!Frames.Verify(_secret,"client",nonce,hello.peer,hello.fingerprint,hello.proof))
                     throw new InvalidDataException("身份校验失败");
                 if(hello.fingerprint!=_fingerprint)
                 {
@@ -342,7 +345,7 @@ public static class FleetLoadTests
                 await Frames.Write(stream,new Packet{type="welcome",peer=identity,proof=Frames.Sign(_secret,"host",hello.nonce,hello.peer,_fingerprint+":"+identity)},deadline.Token).ConfigureAwait(false);
                 connection=new Connection(socket,identity);
                 _peers.TryAdd(identity,connection);
-                Crew.Join(identity,"同行者");
+                lock(_mainThreadGate)Crew.Join(identity,"同行者");
                 var active=connection;
                 await active.Run(Receive).ConfigureAwait(false);
                 // Connection.Run deliberately closes the transport on a malformed/oversized
@@ -352,7 +355,7 @@ public static class FleetLoadTests
             catch{Interlocked.Increment(ref _failures);}
             finally
             {
-                if(connection!=null){_peers.TryRemove(connection.Peer,out _);Crew.Leave(connection.Peer);Interlocked.Increment(ref _removed);connection.Dispose();}
+                if(connection!=null){_peers.TryRemove(connection.Peer,out _);lock(_mainThreadGate)Crew.Leave(connection.Peer);Interlocked.Increment(ref _removed);connection.Dispose();}
                 else socket.Close();
             }
         }
@@ -360,7 +363,8 @@ public static class FleetLoadTests
         {
             if(packet.type=="command"&&packet.command!=null)
             {
-                var result=Ledger.Execute(connection.Peer,packet.command,Apply);
+                CommandResult result;
+                lock(_mainThreadGate)result=Ledger.Execute(connection.Peer,packet.command,Apply);
                 if(result.accepted)Interlocked.Increment(ref _accepted);else Interlocked.Increment(ref _rejected);
                 connection.Send(new Packet{type="result",result=result});
                 Interlocked.Increment(ref _results);
@@ -400,7 +404,7 @@ public static class FleetLoadTests
             var challenge=await Frames.Read(stream,deadline.Token).ConfigureAwait(false);
             if(challenge.type!="challenge")throw new InvalidDataException("challenge missing");
             var peer=Guid.NewGuid().ToString("N");
-            var hello=new Packet{type="hello",protocol=4,peer=peer,nonce=challenge.nonce,name=name,fingerprint=fingerprint};
+            var hello=new Packet{type="hello",protocol=Frames.ProtocolVersion,peer=peer,nonce=challenge.nonce,name=name,fingerprint=fingerprint};
             hello.proof=Frames.Sign(secret,"client",challenge.nonce,peer,fingerprint);
             await Frames.Write(stream,hello,deadline.Token).ConfigureAwait(false);
             var welcome=await Frames.Read(stream,deadline.Token).ConfigureAwait(false);

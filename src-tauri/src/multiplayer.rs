@@ -88,7 +88,7 @@ pub struct MultiplayerStatus {
 #[tauri::command]
 pub fn multiplayer_status(app: tauri::AppHandle) -> Result<MultiplayerStatus> {
     let root = game_root(&load_settings(&app)?)?;
-    let path = app_root(&app)?.join("multiplayer/session/probe.json");
+    let path = app_root(&app)?.join("multiplayer/session/runtime.json");
     let runtime = fs::metadata(&path)
         .ok()
         .filter(|m| m.len() < 65536)
@@ -301,11 +301,7 @@ fn launch_multiplayer_sync(
     fs::create_dir_all(&session).map_err(err)?;
     fs::create_dir_all(&profile).map_err(err)?;
     if !connection.host {
-        let src_prefs = real_data_root.join("PlayerSettings.json");
-        let dst_prefs = profile.join("PlayerSettings.json");
-        if src_prefs.is_file() && !dst_prefs.exists() {
-            let _ = fs::copy(&src_prefs, &dst_prefs);
-        }
+        crate::service::sync_player_settings_file(&real_data_root, &profile, false)?;
     }
     let stop = session.join("stop");
     if stop.exists() {
@@ -323,6 +319,8 @@ fn launch_multiplayer_sync(
             "profile": profile.to_string_lossy(),
             "mode": connection.mode,
             "nickname": connection.nickname,
+            "ticket": connection.ticket,
+            "admissions": if connection.host { session.join("admissions").to_string_lossy().to_string() } else { String::new() },
             "displayMode": display_mode,
             "rules": {
                 "stealing": connection.rules.stealing,

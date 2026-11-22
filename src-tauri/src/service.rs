@@ -218,6 +218,58 @@ pub(crate) fn apply_display_mode(mode: &str) -> Result<()> {
     Ok(())
 }
 
+fn selected_language_index(bytes: &[u8]) -> Option<u64> {
+    let val: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    val.get("GameplayPlayerData")?
+        .get("SelectedLanguageIndex")?
+        .as_u64()
+}
+
+pub(crate) fn sync_player_settings_file(
+    src_dir: &Path,
+    dst_dir: &Path,
+    always_mirror: bool,
+) -> Result<bool> {
+    let src = src_dir.join("PlayerSettings.json");
+    if !src.is_file() {
+        return Ok(false);
+    }
+    let dst = dst_dir.join("PlayerSettings.json");
+    if src == dst {
+        return Ok(false);
+    }
+    let src_bytes = fs::read(&src).map_err(err)?;
+    let should_copy = if !dst.is_file() {
+        true
+    } else {
+        let dst_bytes = fs::read(&dst).map_err(err)?;
+        if src_bytes == dst_bytes {
+            false
+        } else if always_mirror {
+            true
+        } else {
+            let src_lang = selected_language_index(&src_bytes).unwrap_or(0);
+            let dst_lang = selected_language_index(&dst_bytes).unwrap_or(0);
+            if src_lang != 0 && dst_lang == 0 {
+                true
+            } else if src_lang == 0 && dst_lang != 0 {
+                false
+            } else {
+                let src_mtime = fs::metadata(&src).ok().and_then(|m| m.modified().ok());
+                let dst_mtime = fs::metadata(&dst).ok().and_then(|m| m.modified().ok());
+                match (src_mtime, dst_mtime) {
+                    (Some(s), Some(d)) => s > d,
+                    _ => true,
+                }
+            }
+        }
+    };
+    if should_copy {
+        fs::write(&dst, &src_bytes).map_err(err)?;
+    }
+    Ok(should_copy)
+}
+
 pub(crate) fn normalize_windows_path(raw: &str) -> Result<String> {
     let unified = raw.trim().replace('/', "\\");
     let stripped = if let Some(rest) = unified.strip_prefix("\\\\?\\UNC\\") {
@@ -824,6 +876,9 @@ fn launch_game_sync(app: tauri::AppHandle, state: &LauncherState, mode: String) 
         }
     }
     apply_display_mode(&settings.display_mode)?;
+    if let Ok(real_data_root) = flotsam_data_root() {
+        sync_player_settings_file(&real_data_root, &root, true)?;
+    }
     // Preserve Epic's bootstrap path when present. No authentication arguments are manufactured.
     let exe = if root.join("EOSBootstrapper.exe").exists() {
         root.join("EOSBootstrapper.exe")
@@ -1500,5 +1555,39 @@ mod tests {
         assert!(is_newer_version("0.0.1-pre", "v0.0.2-pre"));
         assert!(is_newer_version("0.0.1-pre", "0.1.0"));
         assert!(!is_newer_version("0.0.1", "0.0.1-pre"));
+    }
+    #[test]
+    fn syncs_and_heals_player_settings_language_across_profiles() {
+        let p = sandbox();
+        let real = p.join("real");
+        let client = p.join("client");
+        let game = p.join("game");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(&client).unwrap();
+        fs::create_dir_all(&game).unwrap();
+
+        let zh = br#"{"GameplayPlayerData":{"SelectedLanguageIndex":10,"SnapBuilding":true}}"#;
+        let en = br#"{"GameplayPlayerData":{"SelectedLanguageIndex":0,"SnapBuilding":true}}"#;
+
+        assert!(!sync_player_settings_file(&real, &client, false).unwrap());
+
+        fs::write(real.join("PlayerSettings.json"), zh).unwrap();
+        fs::write(client.join("PlayerSettings.json"), en).unwrap();
+
+        // Heals clobbered English (0) in client-profile even if client-profile was written later.
+        assert!(sync_player_settings_file(&real, &client, false).unwrap());
+        assert_eq!(fs::read(client.join("PlayerSettings.json")).unwrap(), zh);
+        assert!(!sync_player_settings_file(&real, &client, false).unwrap());
+
+        // Mirrors into game working directory so vanilla EpicUser.LoadFile("PlayerSettings.json") reads Chinese.
+        assert!(sync_player_settings_file(&real, &game, true).unwrap());
+        assert_eq!(fs::read(game.join("PlayerSettings.json")).unwrap(), zh);
+
+        // Protects non-English client-profile against accidental English reset in source.
+        fs::write(real.join("PlayerSettings.json"), en).unwrap();
+        assert!(!sync_player_settings_file(&real, &client, false).unwrap());
+        assert_eq!(fs::read(client.join("PlayerSettings.json")).unwrap(), zh);
+
+        fs::remove_dir_all(p).unwrap();
     }
 }

@@ -43,20 +43,8 @@ export async function command<T>(name: string, args: Record<string, unknown> = {
     case 'download_tasks':
     case 'list_mod_profiles':
     case 'last_join_differences': return [] as T;
-    case 'network_interfaces': return [
-      { name: 'WLAN', ip: '192.168.1.24', kind: 'lan' },
-      { name: 'Tailscale', ip: '100.101.20.5', kind: 'vlan' },
-    ] as T;
-    case 'probe_room_connectivity': return {
-      reachable: true,
-      status: 'ok',
-      rttMs: 12,
-      targetAddress: '100.101.20.5:27025',
-      routeKind: 'vlan',
-      diagnosis: '虚拟局域网直连畅通（握手延迟 12 ms）— 房间端口已就绪，可直接加入房间',
-      suggestVlan: false,
-      localVlanIps: ['100.101.20.5 (Tailscale)'],
-    } as T;
+    case 'network_interfaces': return [] as T;
+    case 'probe_room_connectivity': throw new Error('请在桌面版中检测实际网络连通性');
     case 'clear_join_differences': return undefined as T;
     case 'nexus_account': return null as T;
     case 'compatibility_report': return { game: '', loader: false, plugins: [], patchers: [], fingerprint: '', warning: '' } as T;
